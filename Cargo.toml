@@ -21,7 +21,7 @@ quick-xml = "0.31"
 # Rekursiivinen hakemistoläpikäynti
 walkdir = "2"
 # Tiedostovalitsin
-rfd = "0.14"
+rfd = { version = "0.14", default-features = false, features = ["gtk3"] }
 # Virheenkäsittely
 anyhow = "1"
 # Säikeistys tulosten lähettämiseen
