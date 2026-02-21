@@ -1,0 +1,5 @@
+/target
+/DoXgrep-x86_64.AppImage
+/appimagetool-x86_64.AppImage
+**/*.rs.bk
+Cargo.lock

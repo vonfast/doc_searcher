@@ -1,0 +1,44 @@
+name: Build and Release AppImage
+
+on:
+  push:
+    tags:
+      - 'v*' # Laukaisemme julkaisun kun tagi alkaa v-kirjaimella (esim. v0.2.0)
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libgtk-3-dev \
+            pkg-config \
+            libfontconfig1-dev \
+            zenity
+
+      - name: Download appimagetool
+        run: |
+          wget https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+
+      - name: Build AppImage
+        run: |
+          ./build_appimage.sh
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: DoXgrep-x86_64.AppImage
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
