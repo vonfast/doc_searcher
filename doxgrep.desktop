@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=DoXgrep
+Comment=Search text in DOCX, ODT and PDF files
+Exec=doxgrep
+Icon=doxgrep
+Terminal=false
+Categories=Utility;Office;
