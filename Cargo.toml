@@ -20,6 +20,8 @@ pdf-extract = "0.7"
 quick-xml = "0.31"
 # Rekursiivinen hakemistoläpikäynti
 walkdir = "2"
+# Tiedostovalitsin
+rfd = "0.14"
 # Virheenkäsittely
 anyhow = "1"
 # Säikeistys tulosten lähettämiseen
