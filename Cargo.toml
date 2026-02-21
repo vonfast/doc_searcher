@@ -24,6 +24,8 @@ walkdir = "2"
 rfd = { version = "0.14", default-features = false, features = ["gtk3"] }
 # Virheenkäsittely
 anyhow = "1"
+# Tiedostojen avaaminen
+open = "5.3"
 # Säikeistys tulosten lähettämiseen
 crossbeam-channel = "0.5"
 
