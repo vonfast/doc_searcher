@@ -4,7 +4,7 @@ set -e
 # Check for appimagetool
 if ! command -v appimagetool &> /dev/null && [ ! -f "./appimagetool-x86_64.AppImage" ]; then
     echo "Error: appimagetool missing."
-    echo "Download it: wget https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage"
+    echo "Download it: wget https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
     echo "Make it executable: chmod +x appimagetool-x86_64.AppImage"
     exit 1
 fi

@@ -48,7 +48,7 @@ You can build a standalone AppImage that works on most Linux distributions:
 
 1. Download `appimagetool`:
    ```bash
-   wget -O appimagetool-x86_64.AppImage https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-x86_64.AppImage
+   wget -O appimagetool-x86_64.AppImage https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
    chmod +x appimagetool-x86_64.AppImage
    ```
 2. Run the build script:
