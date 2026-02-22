@@ -46,6 +46,9 @@ ln -sf usr/bin/doxgrep "$APPDIR/AppRun"
 
 # 3. Build AppImage
 echo "--- Building AppImage ---"
+# We use --appimage-extract-and-run to avoid FUSE issues on modern distros
+# and export APPIMAGE_EXTRACT_AND_RUN=1 for the tool itself if it's an AppImage
+export APPIMAGE_EXTRACT_AND_RUN=1
 ARCH=x86_64 $APP_TOOL "$APPDIR" DoXgrep-x86_64.AppImage
 
 echo "--- Done: DoXgrep-x86_64.AppImage ---"
