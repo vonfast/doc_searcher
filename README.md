@@ -16,7 +16,7 @@ DoXgrep is a Rust-based desktop application for searching text within `.docx`, `
 ## Installation (Linux)
 
 ### Download AppImage
-The easiest way to use DoXgrep is to download the latest **AppImage** from the [GitHub Releases](https://github.com/USER/PROJECT/releases) page.
+The easiest way to use DoXgrep is to download the latest **AppImage** from the [GitHub Releases](https://github.com/vonfast/doc_searcher/releases) page.
 1. Download `DoXgrep-x86_64.AppImage`.
 2. Make it executable: `chmod +x DoXgrep-x86_64.AppImage`.
 3. Run it: `./DoXgrep-x86_64.AppImage`.
