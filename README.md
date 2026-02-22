@@ -11,7 +11,7 @@ DoXgrep is a Rust-based desktop application for searching text within `.docx`, `
 - **Background Search**: Search operations run in a separate thread, keeping the UI responsive.
 - **File Type Filtering**: Enable or disable specific file formats for your search.
 - **Open Files**: Open found files directly with your system's default application.
-- **Directory Browsing**: Easily select search directories using a native file picker (requires `zenity`).
+- **Directory Browsing**: Select search directories using a native file picker (GTK3 backend on Linux).
 
 ## Installation (Linux)
 
