@@ -2,6 +2,10 @@
 name = "doxgrep"
 version = "0.2.0"
 edition = "2021"
+authors = ["Petri <vonfast@gmail.com>"]
+description = "A simple desktop tool for searching text in PDF, DOCX, and ODT files."
+repository = "https://github.com/vonfast/doc_searcher"
+license = "MIT"
 
 [[bin]]
 name = "doxgrep"
