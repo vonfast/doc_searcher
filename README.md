@@ -1,68 +1,67 @@
 # DoXgrep
 
-DoXgrep is a Rust-based desktop application for searching text within `.docx`, `.odt`, and `.pdf` files. It features a modern graphical user interface built with `egui`.
+A fast, lightweight desktop application for searching text within document files. Built with Rust and featuring a modern GUI powered by `egui`.
 
 ## Features
 
-- **Multi-format Support**: Search through Microsoft Word (.docx), OpenDocument (.odt), and PDF files.
-- **Recursive Search**: Search through all subdirectories within a chosen folder.
-- **Case Sensitivity**: Toggle between case-sensitive and case-insensitive search.
-- **Context Preview**: View snippets of text surrounding the matches, with adjustable context size.
-- **Background Search**: Search operations run in a separate thread, keeping the UI responsive.
-- **File Type Filtering**: Enable or disable specific file formats for your search.
-- **Open Files**: Open found files directly with your system's default application.
-- **Directory Browsing**: Select search directories using a native file picker (GTK3 backend on Linux).
+- **Multi-format Support** — Search through DOCX, ODT, and PDF files
+- **Recursive Directory Search** — Scan entire folder trees with one click
+- **Smart Search** — Case-sensitive/insensitive matching with adjustable context preview
+- **Fast & Responsive** — Background search keeps the UI smooth
+- **File Type Filtering** — Toggle specific formats on/off
+- **Quick Access** — Open matched files directly from results
+- **Native Integration** — GTK3 file picker on Linux
 
-## Installation (Linux)
+## Quick Start
 
-### Download AppImage
-The easiest way to use DoXgrep is to download the latest **AppImage** from the [GitHub Releases](https://github.com/vonfast/doc_searcher/releases) page.
-1. Download `DoXgrep-x86_64.AppImage`.
-2. Make it executable: `chmod +x DoXgrep-x86_64.AppImage`.
-3. Run it: `./DoXgrep-x86_64.AppImage`.
+### Download AppImage (Recommended)
+Download the latest **AppImage** from [GitHub Releases](https://github.com/vonfast/doc_searcher/releases):
 
-### 1. Install Rust
 ```bash
+wget https://github.com/vonfast/doc_searcher/releases/latest/download/DoXgrep-x86_64.AppImage
+chmod +x DoXgrep-x86_64.AppImage
+./DoXgrep-x86_64.AppImage
+```
+
+### Build from Source
+
+**Requirements:** Rust toolchain and system dependencies
+
+```bash
+# Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
-```
 
-### 2. Install System Dependencies
-On Fedora:
-```bash
-sudo dnf install gcc pkg-config \
-    libxcb-devel libxkbcommon-devel \
-    wayland-devel mesa-libGL-devel \
-    fontconfig-devel zenity
-```
+# Install dependencies (Fedora)
+sudo dnf install gcc pkg-config libxcb-devel libxkbcommon-devel \
+    wayland-devel mesa-libGL-devel fontconfig-devel zenity
 
-### 3. Build and Run
-```bash
+# Build and run
 cargo build --release
 ./target/release/doxgrep
 ```
 
-## Distribution (AppImage)
+## Building AppImage
 
-You can build a standalone AppImage that works on most Linux distributions:
+Create a standalone AppImage package:
 
-1. Download `appimagetool`:
-   ```bash
-   wget -O appimagetool-x86_64.AppImage https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
-   chmod +x appimagetool-x86_64.AppImage
-   ```
-2. Run the build script:
-   ```bash
-   ./build_appimage.sh
-   ```
-3. The resulting package will be `DoXgrep-x86_64.AppImage`.
+```bash
+# Download appimagetool
+wget https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+chmod +x appimagetool-x86_64.AppImage
 
-## Adding an Icon
+# Build AppImage
+./build_appimage.sh
+```
 
-To add a custom icon to the AppImage:
-1. Place a PNG file (recommended size 256x256) at `assets/doxgrep.png`.
-2. Re-run `./build_appimage.sh`.
+The resulting `DoXgrep-x86_64.AppImage` works on most Linux distributions without additional dependencies.
+
+## Technology Stack
+
+- **Language:** Rust 2021
+- **GUI Framework:** egui/eframe
+- **Document Parsing:** zip, pdf-extract, quick-xml
+- **File Dialog:** rfd (GTK3 backend)
 
 ## License
 
-This project is licensed under the MIT License or Apache 2.0 (standard for Rust projects).
+MIT License or Apache 2.0 — choose whichever you prefer.
