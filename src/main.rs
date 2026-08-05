@@ -102,8 +102,10 @@ impl DoXgrepApp {
         self.selected_result = None;
     }
 
-    fn poll_messages(&mut self) {
+    fn poll_messages(&mut self, ctx: &egui::Context) {
+        let mut got_msg = false;
         while let Ok(msg) = self.rx.try_recv() {
+            got_msg = true;
             match msg {
                 SearchMessage::Progress(s) => self.progress_msg = s,
                 SearchMessage::Done { results, errors } => {
@@ -121,6 +123,9 @@ impl DoXgrepApp {
                 }
             }
         }
+        if got_msg {
+            ctx.request_repaint();
+        }
     }
 
     fn total_matches(&self) -> usize {
@@ -130,8 +135,10 @@ impl DoXgrepApp {
 
 impl eframe::App for DoXgrepApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_messages();
-        if self.state == SearchState::Searching { ctx.request_repaint(); }
+        self.poll_messages(ctx);
+        if self.state == SearchState::Searching {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
 
         // Top Bar
         egui::TopBottomPanel::top("topbar")

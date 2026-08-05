@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
+use rayon::prelude::*;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -55,10 +56,8 @@ impl Default for SearchOptions {
 
 pub fn search_directory(
     opts: &SearchOptions,
-    progress_cb: impl Fn(String),
+    progress_cb: impl Fn(String) + Sync + Send,
 ) -> Result<(Vec<SearchResult>, Vec<SearchError>)> {
-    let mut results = Vec::new();
-    let mut errors = Vec::new();
     let max_depth = if opts.recursive { usize::MAX } else { 1 };
 
     let entries: Vec<_> = WalkDir::new(&opts.directory)
@@ -68,59 +67,64 @@ pub fn search_directory(
         .filter(|e| e.file_type().is_file())
         .collect();
 
-    for entry in &entries {
-        let path = entry.path();
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
+    let (results_res, errors_res): (Vec<_>, Vec<_>) = entries
+        .into_par_iter()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
 
-        let should_search = match ext.as_str() {
-            "docx" => opts.search_docx,
-            "odt" => opts.search_odt,
-            "pdf" => opts.search_pdf,
-            _ => false,
-        };
+            let should_search = match ext.as_str() {
+                "docx" => opts.search_docx,
+                "odt" => opts.search_odt,
+                "pdf" => opts.search_pdf,
+                _ => false,
+            };
 
-        if !should_search {
-            continue;
-        }
-
-        let filename = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        progress_cb(format!("Reading: {}", filename));
-
-        let text_result = match ext.as_str() {
-            "docx" => Some(extract_docx(path)),
-            "odt" => Some(extract_odt(path)),
-            "pdf" => Some(extract_pdf(path)),
-            _ => None,
-        };
-
-        match text_result {
-            Some(Ok(text)) => {
-                let matches = find_matches(&text, &opts.query, opts.ignore_case, opts.context_size);
-                if !matches.is_empty() {
-                    results.push(SearchResult {
-                        file: path.to_path_buf(),
-                        file_type: ext.to_uppercase(),
-                        matches,
-                    });
-                }
+            if !should_search {
+                return None;
             }
-            Some(Err(e)) => {
-                errors.push(SearchError {
+
+            let filename = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            progress_cb(format!("Reading: {}", filename));
+
+            let text_result = match ext.as_str() {
+                "docx" => extract_docx(path),
+                "odt" => extract_odt(path),
+                "pdf" => extract_pdf(path),
+                _ => return None,
+            };
+
+            match text_result {
+                Ok(text) => {
+                    let matches = find_matches(&text, &opts.query, opts.ignore_case, opts.context_size);
+                    if !matches.is_empty() {
+                        Some(Ok(SearchResult {
+                            file: path.to_path_buf(),
+                            file_type: ext.to_uppercase(),
+                            matches,
+                        }))
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => Some(Err(SearchError {
                     file: path.to_path_buf(),
                     error: e.to_string(),
-                });
+                })),
             }
-            None => {}
-        }
-    }
+        })
+        .partition(Result::is_ok);
+
+    let results = results_res.into_iter().map(Result::unwrap).collect();
+    let errors = errors_res.into_iter().map(Result::unwrap_err).collect();
 
     Ok((results, errors))
 }
@@ -163,7 +167,7 @@ fn extract_text_from_xml(xml: &str) -> Result<String> {
     let mut reader = Reader::from_str(xml);
     reader.trim_text(true);
 
-    let mut text_parts = Vec::new();
+    let mut text_content = String::with_capacity(xml.len() / 2);
     let mut buf = Vec::new();
 
     loop {
@@ -171,11 +175,11 @@ fn extract_text_from_xml(xml: &str) -> Result<String> {
             Ok(Event::Text(e)) => {
                 let text = e.unescape().unwrap_or_default();
                 if !text.trim().is_empty() {
-                    text_parts.push(text.into_owned());
+                    text_content.push_str(&text);
                 }
             }
             Ok(Event::End(_)) => {
-                text_parts.push(" ".to_string());
+                text_content.push(' ');
             }
             Ok(Event::Eof) => break,
             Err(_) => break,
@@ -184,13 +188,58 @@ fn extract_text_from_xml(xml: &str) -> Result<String> {
         buf.clear();
     }
 
-    Ok(text_parts.join(""))
+    Ok(text_content)
 }
 
 /// Extract text from a .pdf file
 pub fn extract_pdf(path: &Path) -> Result<String> {
     pdf_extract::extract_text(path)
         .with_context(|| format!("PDF text extraction failed: {}", path.display()))
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    while !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+fn starts_with_ignore_case(text_slice: &str, query_lower: &str) -> Option<usize> {
+    let mut text_chars = text_slice.chars();
+    let mut query_chars = query_lower.chars();
+    let mut bytes_read = 0;
+
+    while let Some(q_char) = query_chars.next() {
+        if let Some(t_char) = text_chars.next() {
+            bytes_read += t_char.len_utf8();
+            let mut lowered = t_char.to_lowercase();
+            let first_lowered = lowered.next()?;
+            if first_lowered != q_char {
+                return None;
+            }
+            for extra_lowered in lowered {
+                if query_chars.next() != Some(extra_lowered) {
+                    return None;
+                }
+            }
+        } else {
+            return None;
+        }
+    }
+    Some(bytes_read)
 }
 
 pub fn find_matches(
@@ -205,78 +254,54 @@ pub fn find_matches(
         return matches;
     }
 
-    let q = if ignore_case {
-        query.to_lowercase()
-    } else {
-        query.to_string()
-    };
+    let q_lower = query.to_lowercase();
+    let mut char_indices = text.char_indices().peekable();
 
-    let mut it = text.char_indices().peekable();
-
-    while let Some(&(start_idx, _)) = it.peek() {
-        let matched = if ignore_case {
-            text[start_idx..]
-                .to_lowercase()
-                .starts_with(&q)
+    while let Some(&(start_idx, _)) = char_indices.peek() {
+        let match_bytes = if ignore_case {
+            starts_with_ignore_case(&text[start_idx..], &q_lower)
+        } else if text[start_idx..].starts_with(query) {
+            Some(query.len())
         } else {
-            text[start_idx..].starts_with(&q)
+            None
         };
 
-        if matched {
-            let mut end_idx = start_idx;
-            let mut match_len_in_lowercase = 0;
-            let mut temp_it = text[start_idx..].chars();
-            
-            // We need to find how many characters from the original text 
-            // correspond to the match.
-            // This is tricky because one character could become multiple in lowercase.
-            while match_len_in_lowercase < q.len() {
-                if let Some(c) = temp_it.next() {
-                    let lowered = if ignore_case { c.to_lowercase().to_string() } else { c.to_string() };
-                    match_len_in_lowercase += lowered.len();
-                    end_idx += c.len_utf8();
-                } else {
-                    break;
-                }
-            }
+        if let Some(bytes) = match_bytes {
+            let end_idx = start_idx + bytes;
 
-            let ctx_start_idx = start_idx.saturating_sub(context_size);
-            let ctx_end_idx = (end_idx + context_size).min(text.len());
+            let ctx_start_raw = start_idx.saturating_sub(context_size);
+            let ctx_end_raw = (end_idx + context_size).min(text.len());
 
-            // Align to character boundaries
-            let actual_start = text.char_indices()
-                .map(|(i, _)| i)
-                .rfind(|&i| i <= ctx_start_idx)
-                .unwrap_or(0);
-            
-            let actual_end = text.char_indices()
-                .map(|(i, _)| i)
-                .chain(std::iter::once(text.len()))
-                .find(|&i| i >= ctx_end_idx)
-                .unwrap_or(text.len());
+            let actual_start = floor_char_boundary(text, ctx_start_raw);
+            let actual_end = ceil_char_boundary(text, ctx_end_raw);
 
-            let mut context = String::new();
+            let sub_slice = &text[actual_start..actual_end];
+            let mut context = String::with_capacity(sub_slice.len() + 8);
             if actual_start > 0 {
                 context.push_str("… ");
             }
-            context.push_str(&text[actual_start..actual_end]);
+            for (i, word) in sub_slice.split_whitespace().enumerate() {
+                if i > 0 {
+                    context.push(' ');
+                }
+                context.push_str(word);
+            }
             if actual_end < text.len() {
                 context.push_str(" …");
             }
 
-            let context = context.split_whitespace().collect::<Vec<_>>().join(" ");
             matches.push(Match { context });
 
             // Move past the match
-            while let Some(&(i, _)) = it.peek() {
+            while let Some(&(i, _)) = char_indices.peek() {
                 if i < end_idx {
-                    it.next();
+                    char_indices.next();
                 } else {
                     break;
                 }
             }
         } else {
-            it.next();
+            char_indices.next();
         }
     }
 

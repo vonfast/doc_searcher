@@ -32,6 +32,8 @@ anyhow = "1"
 open = "5.3"
 # Säikeistys tulosten lähettämiseen
 crossbeam-channel = "0.5"
+# Rinnakkaislaskenta
+rayon = "1.10"
 
 [profile.release]
 opt-level = 3
@@ -44,3 +46,13 @@ panic = "abort"
 assets = ["assets/"]
 auto_link = true
 auto_link_exclude_list = ["libc.so*", "libpthread.so*"]
+
+[package.metadata.bundle]
+name = "DoXgrep"
+identifier = "com.vonfast.doxgrep"
+icon = ["assets/doxgrep.png"]
+version = "0.2.0"
+copyright = "Copyright © 2026 Petri"
+category = "Utility"
+short_description = "A simple desktop tool for searching text in PDF, DOCX, and ODT files."
+
