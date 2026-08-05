@@ -8,14 +8,14 @@ DoXsearch allows you to instantly search for text inside **DOCX**, **ODT**, and 
 
 ## Key Features
 
-- ⚡ **Multi-Threaded Parallel Search Engine** — Powered by `rayon` to utilize all CPU cores for lightning-fast text extraction and scanning.
-- 📄 **Multi-Format Support** — Deep text extraction from Microsoft Word (`.docx`), OpenDocument Text (`.odt`), and Adobe PDF (`.pdf`) files.
-- 🧠 **Memory-Efficient Case Matching** — Optimized zero-allocation case-insensitive search algorithm designed to prevent memory thrashing on large document stores.
-- 📅 **Date & Relevance Sorting** — Sort matching files by Modification Date (newest/oldest first), File Name (A-Z), or Match Count.
-- 📊 **Smooth Real-Time Progress Bar** — Non-flickering animated progress bar with live completion percentage and processed file counters.
-- 🎯 **Highlighted Context Preview** — Displays matched keywords in surrounding text context with automatic line wrapping.
-- 📂 **One-Click File Access** — Open any matched document directly in your operating system's default viewer.
-- 🖥️ **Cross-Platform Bundles** — Standalone AppImage for Linux and Universal 2 `.app` bundle & `.dmg` installer for macOS (supporting both Apple Silicon M1/M2/M3/M4 and Intel Macs).
+-  **Multi-Threaded Parallel Search Engine** — Powered by `rayon` to utilize all CPU cores for lightning-fast text extraction and scanning.
+-  **Multi-Format Support** — Deep text extraction from Microsoft Word (`.docx`), OpenDocument Text (`.odt`), and Adobe PDF (`.pdf`) files.
+-  **Memory-Efficient Case Matching** — Optimized zero-allocation case-insensitive search algorithm designed to prevent memory thrashing on large document stores.
+-  **Date & Relevance Sorting** — Sort matching files by Modification Date (newest/oldest first), File Name (A-Z), or Match Count.
+-  **Smooth Real-Time Progress Bar** — Non-flickering animated progress bar with live completion percentage and processed file counters.
+-  **Highlighted Context Preview** — Displays matched keywords in surrounding text context with automatic line wrapping.
+-  **One-Click File Access** — Open any matched document directly in your operating system's default viewer.
+-  **Cross-Platform Bundles** — Standalone AppImage for Linux and Universal 2 `.app` bundle & `.dmg` installer for macOS (supporting both Apple Silicon M1/M2/M3/M4 and Intel Macs).
 
 ---
 
