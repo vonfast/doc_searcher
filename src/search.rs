@@ -14,6 +14,7 @@ pub struct SearchResult {
     pub file: PathBuf,
     pub file_type: String,
     pub matches: Vec<Match>,
+    pub modified: Option<std::time::SystemTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,7 +57,7 @@ impl Default for SearchOptions {
 
 pub fn search_directory(
     opts: &SearchOptions,
-    progress_cb: impl Fn(String) + Sync + Send,
+    progress_cb: impl Fn(usize, usize) + Sync + Send,
 ) -> Result<(Vec<SearchResult>, Vec<SearchError>)> {
     let max_depth = if opts.recursive { usize::MAX } else { 1 };
 
@@ -64,8 +65,32 @@ pub fn search_directory(
         .max_depth(max_depth)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
+        .filter(|e| {
+            if !e.file_type().is_file() {
+                return false;
+            }
+            let ext = e
+                .path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            match ext.as_str() {
+                "docx" => opts.search_docx,
+                "odt" => opts.search_odt,
+                "pdf" => opts.search_pdf,
+                _ => false,
+            }
+        })
         .collect();
+
+    let total = entries.len();
+    if total == 0 {
+        progress_cb(0, 0);
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let processed = std::sync::atomic::AtomicUsize::new(0);
 
     let (results_res, errors_res): (Vec<_>, Vec<_>) = entries
         .into_par_iter()
@@ -77,30 +102,17 @@ pub fn search_directory(
                 .unwrap_or("")
                 .to_lowercase();
 
-            let should_search = match ext.as_str() {
-                "docx" => opts.search_docx,
-                "odt" => opts.search_odt,
-                "pdf" => opts.search_pdf,
-                _ => false,
-            };
-
-            if !should_search {
-                return None;
-            }
-
-            let filename = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            progress_cb(format!("Reading: {}", filename));
-
             let text_result = match ext.as_str() {
                 "docx" => extract_docx(path),
                 "odt" => extract_odt(path),
                 "pdf" => extract_pdf(path),
                 _ => return None,
             };
+
+            let current = processed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            progress_cb(current, total);
+
+            let modified = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
 
             match text_result {
                 Ok(text) => {
@@ -110,6 +122,7 @@ pub fn search_directory(
                             file: path.to_path_buf(),
                             file_type: ext.to_uppercase(),
                             matches,
+                            modified,
                         }))
                     } else {
                         None
@@ -123,7 +136,9 @@ pub fn search_directory(
         })
         .partition(Result::is_ok);
 
-    let results = results_res.into_iter().map(Result::unwrap).collect();
+    let mut results: Vec<SearchResult> = results_res.into_iter().map(Result::unwrap).collect();
+    results.sort_by(|a, b| b.modified.cmp(&a.modified));
+
     let errors = errors_res.into_iter().map(Result::unwrap_err).collect();
 
     Ok((results, errors))

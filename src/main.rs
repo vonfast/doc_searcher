@@ -17,7 +17,7 @@ const TEXT_DARK:  Color32 = Color32::from_rgb(15,  23,  42);
 const TEXT_MED:   Color32 = Color32::from_rgb(71,  85,  105);
 
 enum SearchMessage {
-    Progress(String),
+    Progress { processed: usize, total: usize },
     Done {
         results: Vec<SearchResult>,
         errors: Vec<SearchError>,
@@ -25,23 +25,45 @@ enum SearchMessage {
     Error(String),
 }
 
+use chrono::{DateTime, Local};
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum SortOrder {
+    DateDesc,
+    DateAsc,
+    Name,
+    Matches,
+}
+
+impl SortOrder {
+    fn label(&self) -> &'static str {
+        match self {
+            SortOrder::DateDesc => "Date (Newest first)",
+            SortOrder::DateAsc => "Date (Oldest first)",
+            SortOrder::Name => "Name (A-Z)",
+            SortOrder::Matches => "Match Count",
+        }
+    }
+}
+
 #[derive(PartialEq)]
 enum SearchState { Idle, Searching, Done }
 
-struct DoXgrepApp {
+struct DoXsearchApp {
     opts: SearchOptions,
     directory_input: String,
     state: SearchState,
     results: Vec<SearchResult>,
     errors: Vec<SearchError>,
     error: Option<String>,
-    progress_msg: String,
+    progress_count: (usize, usize),
     selected_result: Option<usize>,
+    sort_order: SortOrder,
     tx: Sender<SearchMessage>,
     rx: Receiver<SearchMessage>,
 }
 
-impl DoXgrepApp {
+impl DoXsearchApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let (tx, rx) = bounded(256);
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -52,9 +74,29 @@ impl DoXgrepApp {
             results: Vec::new(),
             errors: Vec::new(),
             error: None,
-            progress_msg: String::new(),
+            progress_count: (0, 0),
             selected_result: None,
+            sort_order: SortOrder::DateDesc,
             tx, rx,
+        }
+    }
+
+    fn sort_results(&mut self) {
+        match self.sort_order {
+            SortOrder::DateDesc => {
+                self.results.sort_by(|a, b| b.modified.cmp(&a.modified));
+            }
+            SortOrder::DateAsc => {
+                self.results.sort_by(|a, b| a.modified.cmp(&b.modified));
+            }
+            SortOrder::Name => {
+                self.results.sort_by(|a, b| {
+                    a.file.file_name().cmp(&b.file.file_name())
+                });
+            }
+            SortOrder::Matches => {
+                self.results.sort_by(|a, b| b.matches.len().cmp(&a.matches.len()));
+            }
         }
     }
 
@@ -73,14 +115,14 @@ impl DoXgrepApp {
         self.errors.clear();
         self.error = None;
         self.selected_result = None;
-        self.progress_msg = "Starting search...".to_string();
+        self.progress_count = (0, 0);
 
         let opts = self.opts.clone();
         let tx = self.tx.clone();
         thread::spawn(move || {
             let tx_p = tx.clone();
-            match search::search_directory(&opts, move |msg| {
-                let _ = tx_p.send(SearchMessage::Progress(msg));
+            match search::search_directory(&opts, move |processed, total| {
+                let _ = tx_p.send(SearchMessage::Progress { processed, total });
             }) {
                 Ok((results, errors)) => {
                     let _ = tx.send(SearchMessage::Done { results, errors });
@@ -98,7 +140,7 @@ impl DoXgrepApp {
         self.opts.query.clear();
         self.state = SearchState::Idle;
         self.error = None;
-        self.progress_msg.clear();
+        self.progress_count = (0, 0);
         self.selected_result = None;
     }
 
@@ -107,12 +149,13 @@ impl DoXgrepApp {
         while let Ok(msg) = self.rx.try_recv() {
             got_msg = true;
             match msg {
-                SearchMessage::Progress(s) => self.progress_msg = s,
+                SearchMessage::Progress { processed, total } => self.progress_count = (processed, total),
                 SearchMessage::Done { results, errors } => {
                     self.results = results;
                     self.errors = errors;
+                    self.sort_results();
                     self.state = SearchState::Done;
-                    self.progress_msg.clear();
+                    self.progress_count = (0, 0);
                     if !self.results.is_empty() {
                         self.selected_result = Some(0);
                     }
@@ -133,7 +176,7 @@ impl DoXgrepApp {
     }
 }
 
-impl eframe::App for DoXgrepApp {
+impl eframe::App for DoXsearchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_messages(ctx);
         if self.state == SearchState::Searching {
@@ -146,7 +189,7 @@ impl eframe::App for DoXgrepApp {
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.add_space(16.0);
-                    ui.label(RichText::new("DoXgrep")
+                    ui.label(RichText::new("DoXsearch")
                         .font(FontId::proportional(22.0))
                         .color(BLUE_DARK).strong());
                     ui.add_space(12.0);
@@ -244,12 +287,15 @@ impl eframe::App for DoXgrepApp {
                             });
 
                             if searching {
-                                ui.add_space(6.0);
-                                ui.horizontal(|ui| {
-                                    ui.spinner();
-                                    ui.label(RichText::new(&self.progress_msg)
-                                        .font(FontId::proportional(11.0)).color(TEXT_MED).italics());
-                                });
+                                ui.add_space(8.0);
+                                let (processed, total) = self.progress_count;
+                                let fraction = if total > 0 { processed as f32 / total as f32 } else { 0.0 };
+                                let text = if total > 0 {
+                                    format!("{:.0}% ({} / {})", fraction * 100.0, processed, total)
+                                } else {
+                                    "Scanning directory...".to_string()
+                                };
+                                ui.add(egui::ProgressBar::new(fraction).text(text).animate(true));
                             }
 
                             if let Some(err) = &self.error.clone() {
@@ -295,15 +341,30 @@ impl eframe::App for DoXgrepApp {
             let mut open_path: Option<PathBuf> = None;
 
             egui::SidePanel::left("file_list_panel")
-                .exact_width(260.0)
+                .exact_width(280.0)
                 .resizable(true)
                 .show(ctx, |ui| {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        ui.add_space(8.0);
+                        ui.add_space(4.0);
                         ui.label(RichText::new(
                             format!("Files ({})", self.results.len()))
                             .font(FontId::proportional(12.0)).color(TEXT_MED).strong());
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let prev_sort = self.sort_order;
+                            egui::ComboBox::from_id_source("sort_order_combo")
+                                .selected_text(RichText::new(self.sort_order.label()).font(FontId::proportional(11.0)))
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.sort_order, SortOrder::DateDesc, SortOrder::DateDesc.label());
+                                    ui.selectable_value(&mut self.sort_order, SortOrder::DateAsc, SortOrder::DateAsc.label());
+                                    ui.selectable_value(&mut self.sort_order, SortOrder::Name, SortOrder::Name.label());
+                                    ui.selectable_value(&mut self.sort_order, SortOrder::Matches, SortOrder::Matches.label());
+                                });
+                            if prev_sort != self.sort_order {
+                                self.sort_results();
+                            }
+                        });
                     });
                     ui.add_space(4.0);
                     ui.separator();
@@ -330,6 +391,13 @@ impl eframe::App for DoXgrepApp {
                                     _      => TEXT_MED,
                                 };
 
+                                let date_str = result.modified
+                                    .map(|sys_time| {
+                                        let dt: DateTime<Local> = sys_time.into();
+                                        dt.format("%d.%m.%Y %H:%M").to_string()
+                                    })
+                                    .unwrap_or_default();
+
                                 ui.add_space(2.0);
 
                                 // Filename — clickable row
@@ -346,13 +414,22 @@ impl eframe::App for DoXgrepApp {
                                 }
                                 ui.add_space(2.0);
 
-                                // Directory path + open button
+                                // Directory path + Date + Matches + open button
                                 ui.horizontal(|ui| {
                                     ui.add_space(4.0);
                                     ui.label(RichText::new(&fdir)
                                         .font(FontId::monospace(10.0)).color(TEXT_MED));
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.add_space(4.0);
+                                    if !date_str.is_empty() {
+                                        ui.label(RichText::new(&date_str)
+                                            .font(FontId::monospace(10.0)).color(TEXT_MED));
+                                        ui.label(RichText::new("•")
+                                            .font(FontId::monospace(10.0)).color(TEXT_MED));
+                                    }
                                     ui.label(RichText::new(
-                                        format!("({} matches)", result.matches.len()))
+                                        format!("{} matches", result.matches.len()))
                                         .font(FontId::proportional(10.0)).color(TEXT_MED));
                                 });
                                 ui.horizontal(|ui| {
@@ -477,8 +554,6 @@ fn render_highlighted(ui: &mut egui::Ui, context: &str, query: &str, ignore_case
         let abs = last + pos;
         if abs > last { job.append(&context[last..abs], 0.0, normal.clone()); }
         
-        // Lasketaan osuman pituus alkuperäisessä tekstissä.
-        // Tämä on tarpeen, koska ignore_case-tilassa to_lowercase() voi muuttaa tavujen määrää.
         let mut end = abs;
         let mut match_len_in_lowercase = 0;
         let mut temp_it = context[abs..].chars();
@@ -497,7 +572,6 @@ fn render_highlighted(ui: &mut egui::Ui, context: &str, query: &str, ignore_case
         if last >= ctx_cmp.len() { break; }
     }
     if last < context.len() { job.append(&context[last..], 0.0, normal); }
-    // Ensure text wraps and is not clipped
     job.wrap.max_width = f32::INFINITY;
     ui.add(egui::Label::new(job).wrap(true));
 }
@@ -505,11 +579,11 @@ fn render_highlighted(ui: &mut egui::Ui, context: &str, query: &str, ignore_case
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("DoXgrep")
+            .with_title("DoXsearch")
             .with_inner_size([1200.0, 750.0])
             .with_min_inner_size([900.0, 500.0]),
         ..Default::default()
     };
-    eframe::run_native("DoXgrep", options,
-        Box::new(|cc| Box::new(DoXgrepApp::new(cc)) as Box<dyn eframe::App>))
+    eframe::run_native("DoXsearch", options,
+        Box::new(|cc| Box::new(DoXsearchApp::new(cc)) as Box<dyn eframe::App>))
 }

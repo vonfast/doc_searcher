@@ -45,7 +45,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: DoXgrep-x86_64.AppImage
+          files: DoXsearch-x86_64.AppImage
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -67,30 +67,30 @@ jobs:
 
       - name: Create Universal Binary & Package App
         run: |
-          mkdir -p target/DoXgrep.app/Contents/MacOS
-          mkdir -p target/DoXgrep.app/Contents/Resources
+          mkdir -p target/DoXsearch.app/Contents/MacOS
+          mkdir -p target/DoXsearch.app/Contents/Resources
 
           # Combine ARM64 (Apple Silicon) and x86_64 (Intel) into Universal Binary
           lipo -create \
-            target/aarch64-apple-darwin/release/doxgrep \
-            target/x86_64-apple-darwin/release/doxgrep \
-            -output target/DoXgrep.app/Contents/MacOS/doxgrep
+            target/aarch64-apple-darwin/release/doxsearch \
+            target/x86_64-apple-darwin/release/doxsearch \
+            -output target/DoXsearch.app/Contents/MacOS/doxsearch
 
-          chmod +x target/DoXgrep.app/Contents/MacOS/doxgrep
+          chmod +x target/DoXsearch.app/Contents/MacOS/doxsearch
           
-          cat <<'EOF' > target/DoXgrep.app/Contents/Info.plist
+          cat <<'EOF' > target/DoXsearch.app/Contents/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
               <key>CFBundleExecutable</key>
-              <string>doxgrep</string>
+              <string>doxsearch</string>
               <key>CFBundleIconFile</key>
-              <string>doxgrep.png</string>
+              <string>doxsearch.png</string>
               <key>CFBundleIdentifier</key>
-              <string>com.vonfast.doxgrep</string>
+              <string>com.vonfast.doxsearch</string>
               <key>CFBundleName</key>
-              <string>DoXgrep</string>
+              <string>DoXsearch</string>
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>CFBundleShortVersionString</key>
@@ -104,20 +104,20 @@ jobs:
           EOF
           
           if [ -f "assets/doxgrep.png" ]; then
-            cp assets/doxgrep.png target/DoXgrep.app/Contents/Resources/doxgrep.png
+            cp assets/doxgrep.png target/DoXsearch.app/Contents/Resources/doxsearch.png
           fi
 
           # Ad-hoc code signing required for macOS Apple Silicon
-          codesign -s - --force --deep target/DoXgrep.app
+          codesign -s - --force --deep target/DoXsearch.app
 
           # Package Zip preserving Mac file attributes
-          ditto -c -k --sequesterRsrc target/DoXgrep.app DoXgrep-macOS-Universal.zip
+          ditto -c -k --sequesterRsrc target/DoXsearch.app DoXsearch-macOS-Universal.zip
 
           # Create DMG image
           mkdir -p target/dmg_stage
-          cp -R target/DoXgrep.app target/dmg_stage/
+          cp -R target/DoXsearch.app target/dmg_stage/
           ln -s /Applications target/dmg_stage/Applications
-          hdiutil create -volname "DoXgrep" -srcfolder target/dmg_stage -ov -format UDZO DoXgrep-macOS-Universal.dmg
+          hdiutil create -volname "DoXsearch" -srcfolder target/dmg_stage -ov -format UDZO DoXsearch-macOS-Universal.dmg
           rm -rf target/dmg_stage
 
       - name: Upload macOS Release Asset
@@ -125,7 +125,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            DoXgrep-macOS-Universal.zip
-            DoXgrep-macOS-Universal.dmg
+            DoXsearch-macOS-Universal.zip
+            DoXsearch-macOS-Universal.dmg
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

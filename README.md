@@ -1,67 +1,104 @@
-# DoXgrep
+# DoXsearch
 
-A fast, lightweight desktop application for searching text within document files. Built with Rust and featuring a modern GUI powered by `egui`.
+A blazingly fast, multi-threaded desktop document search tool built in **Rust** with a sleek GUI powered by **`egui`**.
 
-## Features
+DoXsearch allows you to instantly search for text inside **DOCX**, **ODT**, and **PDF** documents across entire directory trees.
 
-- **Multi-format Support** — Search through DOCX, ODT, and PDF files
-- **Recursive Directory Search** — Scan entire folder trees with one click
-- **Smart Search** — Case-sensitive/insensitive matching with adjustable context preview
-- **Fast & Responsive** — Background search keeps the UI smooth
-- **File Type Filtering** — Toggle specific formats on/off
-- **Quick Access** — Open matched files directly from results
-- **Native Integration** — GTK3 file picker on Linux
+---
 
-## Quick Start
+## Key Features
 
-### Download AppImage (Recommended)
-Download the latest **AppImage** from [GitHub Releases](https://github.com/vonfast/doc_searcher/releases):
+- ⚡ **Multi-Threaded Parallel Search Engine** — Powered by `rayon` to utilize all CPU cores for lightning-fast text extraction and scanning.
+- 📄 **Multi-Format Support** — Deep text extraction from Microsoft Word (`.docx`), OpenDocument Text (`.odt`), and Adobe PDF (`.pdf`) files.
+- 🧠 **Memory-Efficient Case Matching** — Optimized zero-allocation case-insensitive search algorithm designed to prevent memory thrashing on large document stores.
+- 📅 **Date & Relevance Sorting** — Sort matching files by Modification Date (newest/oldest first), File Name (A-Z), or Match Count.
+- 📊 **Smooth Real-Time Progress Bar** — Non-flickering animated progress bar with live completion percentage and processed file counters.
+- 🎯 **Highlighted Context Preview** — Displays matched keywords in surrounding text context with automatic line wrapping.
+- 📂 **One-Click File Access** — Open any matched document directly in your operating system's default viewer.
+- 🖥️ **Cross-Platform Bundles** — Standalone AppImage for Linux and Universal 2 `.app` bundle & `.dmg` installer for macOS (supporting both Apple Silicon M1/M2/M3/M4 and Intel Macs).
+
+---
+
+## Installation & Downloads
+
+### macOS (Universal DMG / App Bundle)
+
+Download the latest `.dmg` or `.zip` release from [GitHub Releases](https://github.com/vonfast/doc_searcher/releases):
+
+1. Download **`DoXsearch-macOS-Universal.dmg`**.
+2. Double-click the `.dmg` file and drag **DoXsearch.app** into your **Applications** folder.
+
+> **Note for macOS users:**  
+> Since the app is built without a paid Apple Developer certificate, macOS Gatekeeper may show a security notice on first launch (*"DoXsearch.app is from an unidentified developer"*).  
+> **To open:** Right-click (or `Control` + click) **DoXsearch.app** in Finder, select **Open**, and confirm **Open**.  
+> Alternatively, run `xattr -cr /Applications/DoXsearch.app` in Terminal to clear the download quarantine attribute.
+
+---
+
+### Linux (AppImage)
+
+Download the standalone **AppImage** from [GitHub Releases](https://github.com/vonfast/doc_searcher/releases):
 
 ```bash
-wget https://github.com/vonfast/doc_searcher/releases/latest/download/DoXgrep-x86_64.AppImage
-chmod +x DoXgrep-x86_64.AppImage
-./DoXgrep-x86_64.AppImage
+wget https://github.com/vonfast/doc_searcher/releases/latest/download/DoXsearch-x86_64.AppImage
+chmod +x DoXsearch-x86_64.AppImage
+./DoXsearch-x86_64.AppImage
 ```
 
-### Build from Source
+---
 
-**Requirements:** Rust toolchain and system dependencies
+## Build from Source
 
+### Prerequisites
+
+Ensure you have the Rust toolchain installed (`rustup`).
+
+#### Linux Build Dependencies (Ubuntu/Debian)
 ```bash
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Install dependencies (Fedora)
-sudo dnf install gcc pkg-config libxcb-devel libxkbcommon-devel \
-    wayland-devel mesa-libGL-devel fontconfig-devel zenity
-
-# Build and run
-cargo build --release
-./target/release/doxgrep
+sudo apt-get update
+sudo apt-get install -y \
+    libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev \
+    libgtk-3-dev pkg-config libfontconfig1-dev zenity
 ```
 
-## Building AppImage
-
-Create a standalone AppImage package:
+#### Build and Run
 
 ```bash
-# Download appimagetool
-wget https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
-chmod +x appimagetool-x86_64.AppImage
+# Clone repository
+git clone https://github.com/vonfast/doc_searcher.git
+cd doc_searcher
 
-# Build AppImage
+# Build and run release binary
+cargo run --release
+```
+
+---
+
+## Creating Packaging Bundles
+
+### Building Linux AppImage
+```bash
 ./build_appimage.sh
 ```
 
-The resulting `DoXgrep-x86_64.AppImage` works on most Linux distributions without additional dependencies.
+### Building macOS App Bundle & DMG
+```bash
+./build_mac_app.sh
+```
 
-## Technology Stack
+---
 
-- **Language:** Rust 2021
-- **GUI Framework:** egui/eframe
-- **Document Parsing:** zip, pdf-extract, quick-xml
-- **File Dialog:** rfd (GTK3 backend)
+## Tech Stack
+
+- **Language:** Rust (2021 Edition)
+- **GUI Framework:** [`eframe`](https://crates.io/crates/eframe) / [`egui`](https://crates.io/crates/egui) (v0.27)
+- **Parallel Processing:** [`rayon`](https://crates.io/crates/rayon)
+- **Document Parsing:** [`pdf-extract`](https://crates.io/crates/pdf-extract), [`quick-xml`](https://crates.io/crates/quick-xml), [`zip`](https://crates.io/crates/zip)
+- **Date Formatting:** [`chrono`](https://crates.io/crates/chrono)
+- **File Dialogs:** [`rfd`](https://crates.io/crates/rfd)
+
+---
 
 ## License
 
-MIT License or Apache 2.0 — choose whichever you prefer.
+Distributed under the [MIT License](LICENSE).
