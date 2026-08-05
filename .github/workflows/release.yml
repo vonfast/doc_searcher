@@ -50,27 +50,32 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-macos:
-    name: Build macOS App Bundle
+    name: Build macOS Universal App Bundle
     runs-on: macos-latest
-    strategy:
-      matrix:
-        target: [aarch64-apple-darwin, x86_64-apple-darwin]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Install Rust Targets
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
 
-      - name: Build macOS Binary
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build macOS Binaries
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
 
-      - name: Package macOS App
+      - name: Create Universal Binary & Package App
         run: |
           mkdir -p target/DoXgrep.app/Contents/MacOS
           mkdir -p target/DoXgrep.app/Contents/Resources
-          cp target/${{ matrix.target }}/release/doxgrep target/DoXgrep.app/Contents/MacOS/doxgrep
+
+          # Combine ARM64 (Apple Silicon) and x86_64 (Intel) into Universal Binary
+          lipo -create \
+            target/aarch64-apple-darwin/release/doxgrep \
+            target/x86_64-apple-darwin/release/doxgrep \
+            -output target/DoXgrep.app/Contents/MacOS/doxgrep
+
           chmod +x target/DoXgrep.app/Contents/MacOS/doxgrep
           
           cat <<'EOF' > target/DoXgrep.app/Contents/Info.plist
@@ -102,21 +107,17 @@ jobs:
             cp assets/doxgrep.png target/DoXgrep.app/Contents/Resources/doxgrep.png
           fi
 
-          if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
-            ZIP_NAME="DoXgrep-macOS-AppleSilicon.zip"
-            DMG_NAME="DoXgrep-macOS-AppleSilicon.dmg"
-          else
-            ZIP_NAME="DoXgrep-macOS-Intel.zip"
-            DMG_NAME="DoXgrep-macOS-Intel.dmg"
-          fi
+          # Ad-hoc code signing required for macOS Apple Silicon
+          codesign -s - --force --deep target/DoXgrep.app
 
-          zip -r -q "$ZIP_NAME" target/DoXgrep.app
+          # Package Zip preserving Mac file attributes
+          ditto -c -k --sequesterRsrc target/DoXgrep.app DoXgrep-macOS-Universal.zip
 
           # Create DMG image
           mkdir -p target/dmg_stage
           cp -R target/DoXgrep.app target/dmg_stage/
           ln -s /Applications target/dmg_stage/Applications
-          hdiutil create -volname "DoXgrep" -srcfolder target/dmg_stage -ov -format UDZO "$DMG_NAME"
+          hdiutil create -volname "DoXgrep" -srcfolder target/dmg_stage -ov -format UDZO DoXgrep-macOS-Universal.dmg
           rm -rf target/dmg_stage
 
       - name: Upload macOS Release Asset
@@ -124,7 +125,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            DoXgrep-macOS-*.zip
-            DoXgrep-macOS-*.dmg
+            DoXgrep-macOS-Universal.zip
+            DoXgrep-macOS-Universal.dmg
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

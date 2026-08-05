@@ -66,6 +66,11 @@ if [ -f "assets/doxgrep.png" ]; then
     cp assets/doxgrep.png "$RESOURCES_DIR/doxgrep.png"
 fi
 
+if command -v codesign &> /dev/null && [ -d "$BUNDLE_DIR" ]; then
+    echo "--- Applying ad-hoc code signature ---"
+    codesign -s - --force --deep "$BUNDLE_DIR"
+fi
+
 if command -v zip &> /dev/null && [ -d "$BUNDLE_DIR" ]; then
     cd target
     zip -r -q "../DoXgrep-macOS.zip" "$APP_NAME.app"
