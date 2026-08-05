@@ -72,3 +72,16 @@ if command -v zip &> /dev/null && [ -d "$BUNDLE_DIR" ]; then
     cd ..
     echo "--- Created DoXgrep-macOS.zip containing $APP_NAME.app ---"
 fi
+
+if command -v hdiutil &> /dev/null && [ -d "$BUNDLE_DIR" ]; then
+    echo "--- Creating DMG disk image ---"
+    DMG_DIR="target/dmg_stage"
+    rm -rf "$DMG_DIR"
+    mkdir -p "$DMG_DIR"
+    cp -R "$BUNDLE_DIR" "$DMG_DIR/"
+    ln -s /Applications "$DMG_DIR/Applications"
+    hdiutil create -volname "DoXgrep" -srcfolder "$DMG_DIR" -ov -format UDZO "DoXgrep-macOS.dmg"
+    rm -rf "$DMG_DIR"
+    echo "--- Created DoXgrep-macOS.dmg ---"
+fi
+

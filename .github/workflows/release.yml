@@ -102,14 +102,22 @@ jobs:
             cp assets/doxgrep.png target/DoXgrep.app/Contents/Resources/doxgrep.png
           fi
 
-          cd target
           if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
             ZIP_NAME="DoXgrep-macOS-AppleSilicon.zip"
+            DMG_NAME="DoXgrep-macOS-AppleSilicon.dmg"
           else
             ZIP_NAME="DoXgrep-macOS-Intel.zip"
+            DMG_NAME="DoXgrep-macOS-Intel.dmg"
           fi
-          zip -r -q "../$ZIP_NAME" DoXgrep.app
-          cd ..
+
+          zip -r -q "$ZIP_NAME" target/DoXgrep.app
+
+          # Create DMG image
+          mkdir -p target/dmg_stage
+          cp -R target/DoXgrep.app target/dmg_stage/
+          ln -s /Applications target/dmg_stage/Applications
+          hdiutil create -volname "DoXgrep" -srcfolder target/dmg_stage -ov -format UDZO "$DMG_NAME"
+          rm -rf target/dmg_stage
 
       - name: Upload macOS Release Asset
         uses: softprops/action-gh-release@v2
@@ -117,5 +125,6 @@ jobs:
         with:
           files: |
             DoXgrep-macOS-*.zip
+            DoXgrep-macOS-*.dmg
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
