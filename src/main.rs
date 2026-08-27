@@ -1339,9 +1339,10 @@ impl eframe::App for DoXsearchApp {
                                     .unwrap_or_default();
                                 let type_color = match result.file_type.as_str() {
                                     "DOCX" => BLUE_MED,
-                                    "ODT"  => GREEN,
+                                    "ODT" | "FODT" => GREEN,
                                     "PDF"  => ORANGE,
-                                    _      => PURPLE,
+                                    "TXT"  => PURPLE,
+                                    _      => TEXT_MED,
                                 };
 
                                 let date_str = result.modified
