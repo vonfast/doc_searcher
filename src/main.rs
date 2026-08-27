@@ -49,6 +49,38 @@ impl SortOrder {
 #[derive(PartialEq)]
 enum SearchState { Idle, Searching, Done }
 
+pub fn truncate_path(path_str: &str, max_chars: usize) -> String {
+    let char_count = path_str.chars().count();
+    if char_count <= max_chars {
+        path_str.to_string()
+    } else {
+        let keep = max_chars.saturating_sub(3);
+        let skip = char_count.saturating_sub(keep);
+        let suffix: String = path_str.chars().skip(skip).collect();
+        format!("...{}", suffix)
+    }
+}
+
+pub fn resolve_directory_path(input: &str) -> PathBuf {
+    let trimmed = input.trim().trim_matches(|c| c == '\'' || c == '"');
+    if trimmed.is_empty() {
+        return PathBuf::from(".");
+    }
+    if trimmed == "~" {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".to_string());
+        return PathBuf::from(home);
+    }
+    if let Some(stripped) = trimmed.strip_prefix("~/").or_else(|| trimmed.strip_prefix("~\\")) {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".to_string());
+        return PathBuf::from(home).join(stripped);
+    }
+    PathBuf::from(trimmed)
+}
+
 struct DoXsearchApp {
     opts: SearchOptions,
     directory_input: String,
@@ -64,9 +96,12 @@ struct DoXsearchApp {
 }
 
 impl DoXsearchApp {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        cc.egui_ctx.set_visuals(egui::Visuals::light());
         let (tx, rx) = bounded(256);
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".to_string());
         Self {
             directory_input: home.clone(),
             opts: SearchOptions { directory: PathBuf::from(&home), ..Default::default() },
@@ -82,6 +117,8 @@ impl DoXsearchApp {
     }
 
     fn sort_results(&mut self) {
+        let selected_path = self.selected_result.and_then(|idx| self.results.get(idx).map(|r| r.file.clone()));
+
         match self.sort_order {
             SortOrder::DateDesc => {
                 self.results.sort_by(|a, b| b.modified.cmp(&a.modified));
@@ -91,12 +128,18 @@ impl DoXsearchApp {
             }
             SortOrder::Name => {
                 self.results.sort_by(|a, b| {
-                    a.file.file_name().cmp(&b.file.file_name())
+                    let name_a = a.file.file_name().map(|n| n.to_string_lossy().to_lowercase());
+                    let name_b = b.file.file_name().map(|n| n.to_string_lossy().to_lowercase());
+                    name_a.cmp(&name_b)
                 });
             }
             SortOrder::Matches => {
                 self.results.sort_by(|a, b| b.matches.len().cmp(&a.matches.len()));
             }
+        }
+
+        if let Some(path) = selected_path {
+            self.selected_result = self.results.iter().position(|r| r.file == path);
         }
     }
 
@@ -105,7 +148,12 @@ impl DoXsearchApp {
             self.error = Some("Please enter a search term first.".to_string());
             return;
         }
-        self.opts.directory = PathBuf::from(&self.directory_input);
+        if !self.opts.search_docx && !self.opts.search_odt && !self.opts.search_pdf {
+            self.error = Some("Please select at least one file type (DOCX, ODT, PDF).".to_string());
+            return;
+        }
+
+        self.opts.directory = resolve_directory_path(&self.directory_input);
         if !self.opts.directory.exists() {
             self.error = Some(format!("Directory not found: {}", self.directory_input));
             return;
@@ -122,7 +170,7 @@ impl DoXsearchApp {
         thread::spawn(move || {
             let tx_p = tx.clone();
             match search::search_directory(&opts, move |processed, total| {
-                let _ = tx_p.send(SearchMessage::Progress { processed, total });
+                let _ = tx_p.try_send(SearchMessage::Progress { processed, total });
             }) {
                 Ok((results, errors)) => {
                     let _ = tx.send(SearchMessage::Done { results, errors });
@@ -377,12 +425,7 @@ impl eframe::App for DoXsearchApp {
                                 let fname = result.file.file_name()
                                     .unwrap_or_default().to_string_lossy().to_string();
                                 let fdir = result.file.parent()
-                                    .map(|p| {
-                                        let s = p.to_string_lossy().to_string();
-                                        if s.len() > 26 {
-                                            format!("...{}", &s[s.len().saturating_sub(23)..])
-                                        } else { s }
-                                    })
+                                    .map(|p| truncate_path(&p.to_string_lossy(), 26))
                                     .unwrap_or_default();
                                 let type_color = match result.file_type.as_str() {
                                     "DOCX" => BLUE_MED,
@@ -449,7 +492,9 @@ impl eframe::App for DoXsearchApp {
 
             self.selected_result = new_sel;
             if let Some(path) = open_path {
-                let _ = open::that(&path);
+                if let Err(e) = open::that(&path) {
+                    self.error = Some(format!("Failed to open file: {}", e));
+                }
             }
         }
 
@@ -491,7 +536,9 @@ impl eframe::App for DoXsearchApp {
                 if ui.button(
                     RichText::new("Open File").color(Color32::WHITE)
                 ).clicked() {
-                    let _ = open::that(&result.file);
+                    if let Err(e) = open::that(&result.file) {
+                        self.error = Some(format!("Failed to open file: {}", e));
+                    }
                 }
             });
             ui.label(RichText::new(result.file.to_string_lossy().as_ref())
@@ -534,45 +581,44 @@ fn ftbtn(ui: &mut egui::Ui, enabled: &mut bool, label: &str, color: Color32) {
 
 fn render_highlighted(ui: &mut egui::Ui, context: &str, query: &str, ignore_case: bool) {
     if query.is_empty() {
-        ui.label(RichText::new(context).font(FontId::proportional(13.0)).color(Color32::from_rgb(180, 180, 180)));
+        ui.label(RichText::new(context).font(FontId::proportional(13.0)).color(TEXT_DARK));
         return;
     }
-    let ctx_cmp = if ignore_case { context.to_lowercase() } else { context.to_string() };
-    let q_cmp   = if ignore_case { query.to_lowercase()   } else { query.to_string() };
+
+    let spans = search::find_match_spans(context, query, ignore_case);
+    if spans.is_empty() {
+        ui.label(RichText::new(context).font(FontId::proportional(13.0)).color(TEXT_DARK));
+        return;
+    }
 
     let mut job = egui::text::LayoutJob::default();
     let normal = egui::TextFormat {
-        font_id: FontId::proportional(13.0), color: Color32::from_rgb(180, 180, 180), ..Default::default()
+        font_id: FontId::proportional(13.0),
+        color: TEXT_DARK,
+        ..Default::default()
     };
     let hi = egui::TextFormat {
-        font_id: FontId::proportional(13.0), color: Color32::WHITE,
-        background: RED_ACCENT, ..Default::default()
+        font_id: FontId::proportional(13.0),
+        color: Color32::WHITE,
+        background: RED_ACCENT,
+        ..Default::default()
     };
 
     let mut last = 0;
-    while let Some(pos) = ctx_cmp[last..].find(&q_cmp) {
-        let abs = last + pos;
-        if abs > last { job.append(&context[last..abs], 0.0, normal.clone()); }
-        
-        let mut end = abs;
-        let mut match_len_in_lowercase = 0;
-        let mut temp_it = context[abs..].chars();
-        while match_len_in_lowercase < q_cmp.len() {
-            if let Some(c) = temp_it.next() {
-                let lowered = if ignore_case { c.to_lowercase().to_string() } else { c.to_string() };
-                match_len_in_lowercase += lowered.len();
-                end += c.len_utf8();
-            } else {
-                break;
-            }
+    for (start, end) in spans {
+        if start > last && start <= context.len() {
+            job.append(&context[last..start], 0.0, normal.clone());
         }
-
-        job.append(&context[abs..end], 0.0, hi.clone());
-        last = end;
-        if last >= ctx_cmp.len() { break; }
+        if end <= context.len() && end >= start {
+            job.append(&context[start..end], 0.0, hi.clone());
+            last = end;
+        }
     }
-    if last < context.len() { job.append(&context[last..], 0.0, normal); }
-    job.wrap.max_width = f32::INFINITY;
+    if last < context.len() {
+        job.append(&context[last..], 0.0, normal);
+    }
+
+    job.wrap.max_width = ui.available_width();
     ui.add(egui::Label::new(job).wrap(true));
 }
 
@@ -587,3 +633,45 @@ fn main() -> eframe::Result<()> {
     eframe::run_native("DoXsearch", options,
         Box::new(|cc| Box::new(DoXsearchApp::new(cc)) as Box<dyn eframe::App>))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_path_ascii() {
+        let path = "/home/user/documents/projects/app";
+        let truncated = truncate_path(path, 20);
+        assert_eq!(truncated.chars().count(), 20);
+        assert!(truncated.starts_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_path_multibyte_no_panic() {
+        let path = "/home/käyttäjä/töitä_ja_asiakirjoja/projekti";
+        let truncated = truncate_path(path, 26);
+        assert_eq!(truncated.chars().count(), 26);
+        assert!(truncated.starts_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_path_short() {
+        let path = "/home/doc";
+        let truncated = truncate_path(path, 26);
+        assert_eq!(truncated, path);
+    }
+
+    #[test]
+    fn test_resolve_directory_path_tilde() {
+        let resolved = resolve_directory_path("~/Documents");
+        assert!(!resolved.to_string_lossy().starts_with('~'));
+        assert!(resolved.to_string_lossy().ends_with("Documents"));
+    }
+
+    #[test]
+    fn test_resolve_directory_path_quoted() {
+        let resolved = resolve_directory_path("'/tmp/test'");
+        assert_eq!(resolved, PathBuf::from("/tmp/test"));
+    }
+}
+

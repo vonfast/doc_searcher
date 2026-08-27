@@ -110,7 +110,9 @@ pub fn search_directory(
             };
 
             let current = processed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            progress_cb(current, total);
+            if current.is_multiple_of(10) || current == total {
+                progress_cb(current, total);
+            }
 
             let modified = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
 
@@ -178,23 +180,95 @@ pub fn extract_odt(path: &Path) -> Result<String> {
     extract_text_from_xml(&xml_content)
 }
 
-fn extract_text_from_xml(xml: &str) -> Result<String> {
+pub fn extract_text_from_xml(xml: &str) -> Result<String> {
     let mut reader = Reader::from_str(xml);
-    reader.trim_text(true);
+    reader.trim_text(false);
 
     let mut text_content = String::with_capacity(xml.len() / 2);
     let mut buf = Vec::new();
 
+    let mut in_text_node = false;
+    let mut in_paragraph = false;
+    let is_docx = xml.contains("w:document") || xml.contains("w:p") || xml.contains("w:t");
+
     loop {
         match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let local = e.local_name();
+                let local_bytes = local.as_ref();
+                if local_bytes == b"t" || local_bytes == b"delText" {
+                    in_text_node = true;
+                }
+                if local_bytes == b"p" || local_bytes == b"h" {
+                    in_paragraph = true;
+                }
+            }
             Ok(Event::Text(e)) => {
-                let text = e.unescape().unwrap_or_default();
-                if !text.trim().is_empty() {
+                let should_extract = if is_docx {
+                    in_text_node
+                } else {
+                    in_text_node || in_paragraph
+                };
+
+                if should_extract {
+                    let text = e.unescape().unwrap_or_default();
                     text_content.push_str(&text);
                 }
             }
-            Ok(Event::End(_)) => {
-                text_content.push(' ');
+            Ok(Event::CData(e)) => {
+                let should_extract = if is_docx {
+                    in_text_node
+                } else {
+                    in_text_node || in_paragraph
+                };
+
+                if should_extract {
+                    if let Ok(text) = std::str::from_utf8(e.as_ref()) {
+                        text_content.push_str(text);
+                    }
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                let local = e.local_name();
+                match local.as_ref() {
+                    b"tab" => {
+                        if in_paragraph || in_text_node {
+                            text_content.push('\t');
+                        }
+                    }
+                    b"br" | b"cr" | b"line-break" => {
+                        if in_paragraph || in_text_node {
+                            text_content.push('\n');
+                        }
+                    }
+                    b"s" => {
+                        if in_paragraph || in_text_node {
+                            let count = e
+                                .attributes()
+                                .filter_map(|a| a.ok())
+                                .find(|a| a.key.local_name().as_ref() == b"c")
+                                .and_then(|a| std::str::from_utf8(&a.value).ok()?.parse::<usize>().ok())
+                                .unwrap_or(1);
+                            for _ in 0..count {
+                                text_content.push(' ');
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(e)) => {
+                let local = e.local_name();
+                let local_bytes = local.as_ref();
+                if local_bytes == b"t" || local_bytes == b"delText" {
+                    in_text_node = false;
+                }
+                if local_bytes == b"p" || local_bytes == b"h" {
+                    in_paragraph = false;
+                    if !text_content.ends_with('\n') && !text_content.is_empty() {
+                        text_content.push('\n');
+                    }
+                }
             }
             Ok(Event::Eof) => break,
             Err(_) => break,
@@ -212,7 +286,7 @@ pub fn extract_pdf(path: &Path) -> Result<String> {
         .with_context(|| format!("PDF text extraction failed: {}", path.display()))
 }
 
-fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+pub fn floor_char_boundary(text: &str, mut index: usize) -> usize {
     if index >= text.len() {
         return text.len();
     }
@@ -222,7 +296,7 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
-fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+pub fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
     if index >= text.len() {
         return text.len();
     }
@@ -232,7 +306,7 @@ fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
-fn starts_with_ignore_case(text_slice: &str, query_lower: &str) -> Option<usize> {
+pub fn starts_with_ignore_case(text_slice: &str, query_lower: &str) -> Option<usize> {
     let mut text_chars = text_slice.chars();
     let mut query_chars = query_lower.chars();
     let mut bytes_read = 0;
@@ -257,16 +331,14 @@ fn starts_with_ignore_case(text_slice: &str, query_lower: &str) -> Option<usize>
     Some(bytes_read)
 }
 
-pub fn find_matches(
+pub fn find_match_spans(
     text: &str,
     query: &str,
     ignore_case: bool,
-    context_size: usize,
-) -> Vec<Match> {
-    let mut matches = Vec::new();
-
+) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
     if query.is_empty() {
-        return matches;
+        return spans;
     }
 
     let q_lower = query.to_lowercase();
@@ -283,29 +355,7 @@ pub fn find_matches(
 
         if let Some(bytes) = match_bytes {
             let end_idx = start_idx + bytes;
-
-            let ctx_start_raw = start_idx.saturating_sub(context_size);
-            let ctx_end_raw = (end_idx + context_size).min(text.len());
-
-            let actual_start = floor_char_boundary(text, ctx_start_raw);
-            let actual_end = ceil_char_boundary(text, ctx_end_raw);
-
-            let sub_slice = &text[actual_start..actual_end];
-            let mut context = String::with_capacity(sub_slice.len() + 8);
-            if actual_start > 0 {
-                context.push_str("… ");
-            }
-            for (i, word) in sub_slice.split_whitespace().enumerate() {
-                if i > 0 {
-                    context.push(' ');
-                }
-                context.push_str(word);
-            }
-            if actual_end < text.len() {
-                context.push_str(" …");
-            }
-
-            matches.push(Match { context });
+            spans.push((start_idx, end_idx));
 
             // Move past the match
             while let Some(&(i, _)) = char_indices.peek() {
@@ -318,6 +368,43 @@ pub fn find_matches(
         } else {
             char_indices.next();
         }
+    }
+
+    spans
+}
+
+pub fn find_matches(
+    text: &str,
+    query: &str,
+    ignore_case: bool,
+    context_size: usize,
+) -> Vec<Match> {
+    let spans = find_match_spans(text, query, ignore_case);
+    let mut matches = Vec::with_capacity(spans.len());
+
+    for (start_idx, end_idx) in spans {
+        let ctx_start_raw = start_idx.saturating_sub(context_size);
+        let ctx_end_raw = (end_idx + context_size).min(text.len());
+
+        let actual_start = floor_char_boundary(text, ctx_start_raw);
+        let actual_end = ceil_char_boundary(text, ctx_end_raw);
+
+        let sub_slice = &text[actual_start..actual_end];
+        let mut context = String::with_capacity(sub_slice.len() + 8);
+        if actual_start > 0 {
+            context.push_str("… ");
+        }
+        for (i, word) in sub_slice.split_whitespace().enumerate() {
+            if i > 0 {
+                context.push(' ');
+            }
+            context.push_str(word);
+        }
+        if actual_end < text.len() {
+            context.push_str(" …");
+        }
+
+        matches.push(Match { context });
     }
 
     matches
@@ -337,7 +424,6 @@ mod tests {
 
     #[test]
     fn test_case_insensitive_multibyte_lowercase_size_change() {
-        // 'ẞ' (LATIN CAPITAL LETTER SHARP S) lowercase is 'große' in Rust
         let text = "GROẞE";
         let query = "große";
         let matches = find_matches(text, query, true, 10);
@@ -348,19 +434,55 @@ mod tests {
     fn test_overlap_avoidance() {
         let text = "aaaaa";
         let query = "aa";
-        // Jos hyppäämme koko sanan yli, "aaaaa" hakusanalla "aa" pitäisi löytää 2 osumaa:
-        // 1. "aa" kohdassa 0
-        // 2. "aa" kohdassa 2 (kohta 1 ohitetaan koska se on osa ensimmäistä osumaa)
         let matches = find_matches(text, query, false, 10);
         assert_eq!(matches.len(), 2);
     }
 
     #[test]
     fn test_boundary_panic_prevention() {
-        // Testataan että ei kaadu jos hakusana on merkin keskellä
         let text = "🦀🦀🦀";
         let query = "🦀";
         let matches = find_matches(text, query, false, 10);
         assert_eq!(matches.len(), 3);
+    }
+
+    #[test]
+    fn test_xml_multi_run_phrase_matching() {
+        let xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:body>
+                <w:p>
+                    <w:r><w:t>Tämä on </w:t></w:r>
+                    <w:r><w:rPr><w:b/></w:rPr><w:t>tärkeä</w:t></w:r>
+                    <w:r><w:t> asiakirja.</w:t></w:r>
+                </w:p>
+                <w:p>
+                    <w:r><w:t>Toinen kappale.</w:t></w:r>
+                </w:p>
+            </w:body>
+        </w:document>"#;
+        let extracted = extract_text_from_xml(xml).expect("XML extraction failed");
+        assert_eq!(extracted, "Tämä on tärkeä asiakirja.\nToinen kappale.\n");
+
+        let matches = find_matches(&extracted, "tärkeä asiakirja", false, 50);
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn test_odt_xml_extraction() {
+        let xml = r#"<office:document-content xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+            <text:p>Ensimmäinen<text:s text:c="3"/>kohta</text:p>
+            <text:h>Otsikko</text:h>
+        </office:document-content>"#;
+        let extracted = extract_text_from_xml(xml).expect("XML extraction failed");
+        assert_eq!(extracted, "Ensimmäinen   kohta\nOtsikko\n");
+    }
+
+    #[test]
+    fn test_find_match_spans_accuracy() {
+        let text = "Öljy ja Vesi öljy";
+        let spans = find_match_spans(text, "öljy", true);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(&text[spans[0].0..spans[0].1], "Öljy");
+        assert_eq!(&text[spans[1].0..spans[1].1], "öljy");
     }
 }
