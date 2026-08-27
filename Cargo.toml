@@ -36,13 +36,14 @@ crossbeam-channel = "0.5"
 rayon = "1.10"
 # Päivämäärän muotoilu
 chrono = "0.4"
+# Flate/Zlib purku vioittuneiden PDF-virtojen toipumiseen
+flate2 = "1.0"
 
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = true
-panic = "abort"
 
 [package.metadata.appimage]
 assets = ["assets/"]

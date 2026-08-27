@@ -1,11 +1,13 @@
 mod search;
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
 use egui::{Color32, FontId, RichText, Vec2};
-use search::{DocumentCache, SearchError, SearchOptions, SearchResult};
+use search::{DocumentCache, SearchError, SearchOptions, SearchResult, SearchStats};
 use std::io::Write;
 use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::thread;
 
 const BLUE_DARK:  Color32 = Color32::from_rgb(30,  58,  138);
@@ -19,11 +21,16 @@ const TEXT_DARK:  Color32 = Color32::from_rgb(15,  23,  42);
 const TEXT_MED:   Color32 = Color32::from_rgb(71,  85,  105);
 
 enum SearchMessage {
-    Progress { processed: usize, total: usize },
-    MatchFound(SearchResult),
-    ErrorFound(SearchError),
-    Done,
-    Error(String),
+    Progress { search_id: usize, processed: usize, total: usize },
+    MatchFound { search_id: usize, result: SearchResult },
+    ErrorFound { search_id: usize, error: SearchError },
+    Done {
+        search_id: usize,
+        cached_count: usize,
+        total_count: usize,
+        duration: std::time::Duration,
+    },
+    Error { search_id: usize, message: String },
 }
 
 use chrono::{DateTime, Local};
@@ -113,7 +120,7 @@ impl DateFilter {
         }
     }
 
-    fn to_system_time(&self) -> Option<std::time::SystemTime> {
+    fn to_system_time(self) -> Option<std::time::SystemTime> {
         let now = std::time::SystemTime::now();
         match self {
             DateFilter::All => None,
@@ -151,7 +158,7 @@ impl SizeFilter {
         }
     }
 
-    fn to_mb(&self) -> Option<u64> {
+    fn to_mb(self) -> Option<u64> {
         match self {
             SizeFilter::NoLimit => None,
             SizeFilter::Max10MB => Some(10),
@@ -176,98 +183,236 @@ pub fn os_name() -> &'static str {
     }
 }
 
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum LinuxFileManager {
+    Dolphin,
+    Nautilus,
+    Nemo,
+    Thunar,
+    Generic,
+}
+
+static LINUX_FM_CACHE: OnceLock<LinuxFileManager> = OnceLock::new();
+
+pub fn detect_linux_file_manager() -> LinuxFileManager {
+    *LINUX_FM_CACHE.get_or_init(|| {
+        // 1. Check default mime handler for inode/directory
+        if let Ok(out) = std::process::Command::new("xdg-mime")
+            .args(["query", "default", "inode/directory"])
+            .output()
+        {
+            let mime = String::from_utf8_lossy(&out.stdout).to_lowercase();
+            if mime.contains("dolphin") {
+                return LinuxFileManager::Dolphin;
+            } else if mime.contains("nautilus") || mime.contains("gnome") {
+                return LinuxFileManager::Nautilus;
+            } else if mime.contains("nemo") {
+                return LinuxFileManager::Nemo;
+            } else if mime.contains("thunar") {
+                return LinuxFileManager::Thunar;
+            }
+        }
+
+        // 2. Check XDG_CURRENT_DESKTOP / DESKTOP_SESSION
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP")
+            .or_else(|_| std::env::var("DESKTOP_SESSION"))
+            .unwrap_or_default()
+            .to_uppercase();
+
+        if desktop.contains("KDE") || desktop.contains("PLASMA") {
+            LinuxFileManager::Dolphin
+        } else if desktop.contains("GNOME") {
+            LinuxFileManager::Nautilus
+        } else if desktop.contains("CINNAMON") {
+            LinuxFileManager::Nemo
+        } else if desktop.contains("XFCE") {
+            LinuxFileManager::Thunar
+        } else {
+            LinuxFileManager::Generic
+        }
+    })
+}
+
 pub fn os_file_manager_name(lang: AppLanguage) -> &'static str {
-    match lang {
-        AppLanguage::Finnish => {
-            if cfg!(target_os = "macos") {
-                "Finder"
-            } else if cfg!(target_os = "windows") {
-                "Resurssienhallinta"
-            } else {
-                "Tiedostonhallinta"
-            }
-        }
-        AppLanguage::English => {
-            if cfg!(target_os = "macos") {
-                "Finder"
-            } else if cfg!(target_os = "windows") {
-                "File Explorer"
-            } else {
-                "File Manager"
-            }
-        }
-    }
-}
-
-pub fn get_user_home_dir() -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
-}
-
-pub fn get_user_documents_dir() -> PathBuf {
-    #[cfg(target_os = "linux")]
+    #[cfg(target_os = "macos")]
     {
-        if let Ok(out) = std::process::Command::new("xdg-user-dir").arg("DOCUMENTS").output() {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !s.is_empty() {
-                    let p = PathBuf::from(&s);
-                    if p.exists() {
-                        return p;
-                    }
-                }
-            }
-        }
+        let _ = lang;
+        "Finder"
     }
 
     #[cfg(target_os = "windows")]
     {
-        if let Ok(userprofile) = std::env::var("USERPROFILE") {
-            let onedrive_docs = PathBuf::from(&userprofile).join("OneDrive").join("Documents");
-            if onedrive_docs.exists() {
-                return onedrive_docs;
-            }
-            let docs = PathBuf::from(&userprofile).join("Documents");
-            if docs.exists() {
-                return docs;
-            }
+        match lang {
+            AppLanguage::Finnish => "Resurssienhallinta",
+            AppLanguage::English => "File Explorer",
         }
     }
 
-    let home = get_user_home_dir();
-    let docs = home.join("Documents");
-    if docs.exists() {
-        docs
-    } else {
-        home
+    #[cfg(target_os = "linux")]
+    {
+        match detect_linux_file_manager() {
+            LinuxFileManager::Dolphin => "Dolphin",
+            LinuxFileManager::Nautilus => match lang {
+                AppLanguage::Finnish => "Tiedostot (Nautilus)",
+                AppLanguage::English => "Files (Nautilus)",
+            },
+            LinuxFileManager::Nemo => "Nemo",
+            LinuxFileManager::Thunar => "Thunar",
+            LinuxFileManager::Generic => match lang {
+                AppLanguage::Finnish => "Tiedostonhallinta",
+                AppLanguage::English => "File Manager",
+            },
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        match lang {
+            AppLanguage::Finnish => "Tiedostonhallinta",
+            AppLanguage::English => "File Manager",
+        }
     }
 }
 
-pub fn get_user_downloads_dir() -> PathBuf {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(out) = std::process::Command::new("xdg-user-dir").arg("DOWNLOAD").output() {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !s.is_empty() {
-                    let p = PathBuf::from(&s);
-                    if p.exists() {
-                        return p;
+static USER_HOME_CACHE: OnceLock<PathBuf> = OnceLock::new();
+static USER_DOCS_CACHE: OnceLock<PathBuf> = OnceLock::new();
+static USER_DL_CACHE: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn get_user_home_dir() -> PathBuf {
+    USER_HOME_CACHE.get_or_init(|| {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home)
+    }).clone()
+}
+
+pub fn get_user_documents_dir() -> PathBuf {
+    USER_DOCS_CACHE.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(out) = std::process::Command::new("xdg-user-dir").arg("DOCUMENTS").output() {
+                if out.status.success() {
+                    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !s.is_empty() {
+                        let p = PathBuf::from(&s);
+                        if p.exists() {
+                            return p;
+                        }
                     }
                 }
             }
         }
+
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(userprofile) = std::env::var("USERPROFILE") {
+                let onedrive_docs = PathBuf::from(&userprofile).join("OneDrive").join("Documents");
+                if onedrive_docs.exists() {
+                    return onedrive_docs;
+                }
+                let docs = PathBuf::from(&userprofile).join("Documents");
+                if docs.exists() {
+                    return docs;
+                }
+            }
+        }
+
+        let home = get_user_home_dir();
+        let docs = home.join("Documents");
+        if docs.exists() {
+            docs
+        } else {
+            home
+        }
+    }).clone()
+}
+
+pub fn get_user_downloads_dir() -> PathBuf {
+    USER_DL_CACHE.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(out) = std::process::Command::new("xdg-user-dir").arg("DOWNLOAD").output() {
+                if out.status.success() {
+                    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !s.is_empty() {
+                        let p = PathBuf::from(&s);
+                        if p.exists() {
+                            return p;
+                        }
+                    }
+                }
+            }
+        }
+
+        let home = get_user_home_dir();
+        let dl = home.join("Downloads");
+        if dl.exists() {
+            dl
+        } else {
+            home
+        }
+    }).clone()
+}
+
+pub fn pick_folder_dialog(start_dir: Option<&std::path::Path>) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        if detect_linux_file_manager() == LinuxFileManager::Dolphin {
+            let start = start_dir
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| get_user_documents_dir().to_string_lossy().to_string());
+            if let Ok(out) = std::process::Command::new("kdialog")
+                .args(["--getexistingdirectory", &start])
+                .output()
+            {
+                if out.status.success() {
+                    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !s.is_empty() {
+                        let p = PathBuf::from(&s);
+                        if p.exists() {
+                            return Some(p);
+                        }
+                    }
+                }
+                // kdialog was executed. If user cancelled (exit code 1) or returned empty, do not show a second dialog.
+                return None;
+            }
+        }
     }
 
-    let home = get_user_home_dir();
-    let dl = home.join("Downloads");
-    if dl.exists() {
-        dl
-    } else {
-        home
+    let mut dialog = rfd::FileDialog::new();
+    if let Some(dir) = start_dir {
+        dialog = dialog.set_directory(dir);
     }
+    dialog.pick_folder()
+}
+
+pub fn save_file_dialog(default_name: &str, filter_ext: &str) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        if detect_linux_file_manager() == LinuxFileManager::Dolphin {
+            let start = get_user_documents_dir().join(default_name);
+            if let Ok(out) = std::process::Command::new("kdialog")
+                .args(["--getsavefilename", &start.to_string_lossy(), &format!("*.{filter_ext}")])
+                .output()
+            {
+                if out.status.success() {
+                    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !s.is_empty() {
+                        return Some(PathBuf::from(&s));
+                    }
+                }
+                // kdialog was executed. If user cancelled (exit code 1) or returned empty, do not show a second dialog.
+                return None;
+            }
+        }
+    }
+
+    rfd::FileDialog::new()
+        .set_file_name(default_name)
+        .add_filter("CSV files", &[filter_ext])
+        .save_file()
 }
 
 pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
@@ -307,9 +452,43 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
 
     #[cfg(target_os = "linux")]
     {
-        // 1. Try DBus org.freedesktop.FileManager1.ShowItems to highlight file in Nautilus, Dolphin, Thunar, etc.
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let fm = detect_linux_file_manager();
+
+        // 1. Direct invocation based on detected file manager:
+        match fm {
+            LinuxFileManager::Dolphin => {
+                if std::process::Command::new("dolphin")
+                    .arg("--select")
+                    .arg(&canonical)
+                    .spawn().is_ok()
+                {
+                    return Ok(());
+                }
+            }
+            LinuxFileManager::Nautilus => {
+                if std::process::Command::new("nautilus")
+                    .arg("--select")
+                    .arg(&canonical)
+                    .spawn().is_ok()
+                {
+                    return Ok(());
+                }
+            }
+            LinuxFileManager::Nemo => {
+                if std::process::Command::new("nemo")
+                    .arg(&canonical)
+                    .spawn().is_ok()
+                {
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+
+        // 2. Try DBus org.freedesktop.FileManager1.ShowItems
         let uri = format!("file://{}", canonical.display());
+        let uri = path_to_file_uri(&canonical);
         let dbus_result = std::process::Command::new("dbus-send")
             .args([
                 "--session",
@@ -317,8 +496,8 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
                 "--type=method_call",
                 "/org/freedesktop/FileManager1",
                 "org.freedesktop.FileManager1.ShowItems",
-                &format!("array:string:\"{}\"", uri),
-                "string:\"\"",
+                &format!("array:string:{}", uri),
+                "string:",
             ])
             .status();
 
@@ -328,8 +507,8 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
             }
         }
 
-        // 2. Fallback: open parent folder with default file manager
-        let parent = path.parent().unwrap_or(path);
+        // 3. Fallback: open parent folder with default file manager
+        let parent = canonical.parent().unwrap_or(&canonical);
         open::that(parent).map_err(|e| format!("Failed to open folder: {e}"))
     }
 
@@ -338,6 +517,24 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
         let parent = path.parent().unwrap_or(path);
         open::that(parent).map_err(|e| format!("Failed to open folder: {e}"))
     }
+}
+
+/// Converts a local filesystem path into an RFC 3986 compliant file URI with percent-encoding for special characters.
+pub fn path_to_file_uri(path: &Path) -> String {
+    let path_str = path.to_string_lossy();
+    let mut uri = String::from("file://");
+    for byte in path_str.as_bytes() {
+        match *byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                uri.push(*byte as char);
+            }
+            b => {
+                use std::fmt::Write;
+                let _ = write!(uri, "%{:02X}", b);
+            }
+        }
+    }
+    uri
 }
 
 pub fn truncate_path(path_str: &str, max_chars: usize) -> String {
@@ -352,18 +549,34 @@ pub fn truncate_path(path_str: &str, max_chars: usize) -> String {
     }
 }
 
+pub fn clean_path(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        p
+    }
+}
+
 pub fn resolve_directory_path(input: &str) -> PathBuf {
     let trimmed = input.trim().trim_matches(|c| c == '\'' || c == '"');
     if trimmed.is_empty() {
         return PathBuf::from(".");
     }
-    if trimmed == "~" {
-        return get_user_home_dir();
-    }
-    if let Some(stripped) = trimmed.strip_prefix("~/").or_else(|| trimmed.strip_prefix("~\\")) {
-        return get_user_home_dir().join(stripped);
-    }
-    PathBuf::from(trimmed)
+    let p = if trimmed == "~" {
+        get_user_home_dir()
+    } else if let Some(stripped) = trimmed.strip_prefix("~/").or_else(|| trimmed.strip_prefix("~\\")) {
+        get_user_home_dir().join(stripped)
+    } else {
+        PathBuf::from(trimmed)
+    };
+
+    let resolved = if let Ok(canon) = p.canonicalize() {
+        canon
+    } else {
+        p
+    };
+    clean_path(resolved)
 }
 
 struct DoXsearchApp {
@@ -380,7 +593,10 @@ struct DoXsearchApp {
     size_filter: SizeFilter,
     recent_directories: Vec<String>,
     cache: DocumentCache,
+    last_search_stats: Option<SearchStats>,
     lang: AppLanguage,
+    current_search_id: usize,
+    cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     tx: Sender<SearchMessage>,
     rx: Receiver<SearchMessage>,
 }
@@ -388,7 +604,7 @@ struct DoXsearchApp {
 impl DoXsearchApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::light());
-        let (tx, rx) = bounded(256);
+        let (tx, rx) = crossbeam_channel::unbounded();
         let initial_dir = get_user_documents_dir().to_string_lossy().to_string();
         Self {
             directory_input: initial_dir.clone(),
@@ -404,9 +620,23 @@ impl DoXsearchApp {
             size_filter: SizeFilter::NoLimit,
             recent_directories: vec![initial_dir],
             cache: DocumentCache::new(),
+            last_search_stats: None,
             lang: AppLanguage::detect_from_system(),
+            current_search_id: 0,
+            cancel_flag: None,
             tx,
             rx,
+        }
+    }
+
+    fn cancel_search(&mut self) {
+        if let Some(flag) = &self.cancel_flag {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.cancel_flag = None;
+        if self.state == SearchState::Searching {
+            self.state = SearchState::Idle;
+            self.progress_count = (0, 0);
         }
     }
 
@@ -438,6 +668,9 @@ impl DoXsearchApp {
     }
 
     fn start_search(&mut self) {
+        // Cancel any existing search before starting a new one
+        self.cancel_search();
+
         if self.opts.query.trim().is_empty() {
             self.error = Some(if self.lang == AppLanguage::Finnish {
                 "Kirjoita ensin hakusana.".to_string()
@@ -477,6 +710,11 @@ impl DoXsearchApp {
         self.opts.modified_after = self.date_filter.to_system_time();
         self.opts.max_file_size_mb = self.size_filter.to_mb();
 
+        self.current_search_id += 1;
+        let search_id = self.current_search_id;
+        let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.cancel_flag = Some(cancel_flag.clone());
+
         self.state = SearchState::Searching;
         self.results.clear();
         self.errors.clear();
@@ -494,27 +732,38 @@ impl DoXsearchApp {
             match search::search_directory(
                 &opts,
                 &cache,
+                Some(&cancel_flag),
                 move |result| {
-                    let _ = tx_match.send(SearchMessage::MatchFound(result));
+                    let _ = tx_match.send(SearchMessage::MatchFound { search_id, result });
                 },
                 move |error| {
-                    let _ = tx_err.send(SearchMessage::ErrorFound(error));
+                    let _ = tx_err.send(SearchMessage::ErrorFound { search_id, error });
                 },
                 move |processed, total| {
-                    let _ = tx_prog.try_send(SearchMessage::Progress { processed, total });
+                    let _ = tx_prog.send(SearchMessage::Progress { search_id, processed, total });
                 },
             ) {
-                Ok(()) => {
-                    let _ = tx.send(SearchMessage::Done);
+                Ok(stats) => {
+                    let _ = tx.send(SearchMessage::Done {
+                        search_id,
+                        cached_count: stats.cached_count,
+                        total_count: stats.total_count,
+                        duration: stats.duration,
+                    });
                 }
                 Err(e) => {
-                    let _ = tx.send(SearchMessage::Error(e.to_string()));
+                    let _ = tx.send(SearchMessage::Error {
+                        search_id,
+                        message: e.to_string(),
+                    });
                 }
             }
         });
     }
 
     fn clear_search(&mut self) {
+        self.cancel_search();
+        self.current_search_id += 1;
         self.results.clear();
         self.errors.clear();
         self.opts.query.clear();
@@ -522,6 +771,7 @@ impl DoXsearchApp {
         self.error = None;
         self.progress_count = (0, 0);
         self.selected_result = None;
+        self.last_search_stats = None;
     }
 
     fn poll_messages(&mut self, ctx: &egui::Context) {
@@ -530,35 +780,56 @@ impl DoXsearchApp {
         while let Ok(msg) = self.rx.try_recv() {
             got_msg = true;
             match msg {
-                SearchMessage::Progress { processed, total } => {
-                    self.progress_count = (processed, total);
-                }
-                SearchMessage::MatchFound(result) => {
-                    self.results.push(result);
-                    new_matches = true;
-                    if self.selected_result.is_none() {
-                        self.selected_result = Some(0);
+                SearchMessage::Progress { search_id, processed, total } => {
+                    if search_id == self.current_search_id {
+                        self.progress_count = (processed, total);
                     }
                 }
-                SearchMessage::ErrorFound(err) => {
-                    self.errors.push(err);
-                }
-                SearchMessage::Done => {
-                    self.sort_results();
-                    self.state = SearchState::Done;
-                    self.progress_count = (0, 0);
-                    if !self.results.is_empty() && self.selected_result.is_none() {
-                        self.selected_result = Some(0);
+                SearchMessage::MatchFound { search_id, result } => {
+                    if search_id == self.current_search_id {
+                        self.results.push(result);
+                        new_matches = true;
+                        if self.selected_result.is_none() {
+                            self.selected_result = Some(0);
+                        }
                     }
                 }
-                SearchMessage::Error(e) => {
-                    self.error = Some(e);
-                    self.state = SearchState::Idle;
+                SearchMessage::ErrorFound { search_id, error } => {
+                    if search_id == self.current_search_id {
+                        self.errors.push(error);
+                    }
+                }
+                SearchMessage::Done { search_id, cached_count, total_count, duration } => {
+                    if search_id == self.current_search_id {
+                        self.sort_results();
+                        self.state = SearchState::Done;
+                        self.progress_count = (0, 0);
+                        self.last_search_stats = Some(SearchStats {
+                            cached_count,
+                            total_count,
+                            duration,
+                        });
+                        if !self.results.is_empty() && self.selected_result.is_none() {
+                            self.selected_result = Some(0);
+                        }
+                    }
+                }
+                SearchMessage::Error { search_id, message } => {
+                    if search_id == self.current_search_id {
+                        self.error = Some(message);
+                        self.state = SearchState::Idle;
+                    }
                 }
             }
         }
         if new_matches {
             self.sort_results();
+        }
+        // Ensure selected_result is valid and within bounds
+        if let Some(sel) = self.selected_result {
+            if sel >= self.results.len() {
+                self.selected_result = if self.results.is_empty() { None } else { Some(0) };
+            }
         }
         if got_msg {
             ctx.request_repaint();
@@ -579,11 +850,7 @@ impl DoXsearchApp {
             return;
         }
 
-        let Some(path) = rfd::FileDialog::new()
-            .set_file_name("doxsearch-results.csv")
-            .add_filter("CSV files", &["csv"])
-            .save_file()
-        else {
+        let Some(path) = save_file_dialog("doxsearch-results.csv", "csv") else {
             return;
         };
 
@@ -612,12 +879,15 @@ fn save_results_csv(
     query: &str,
     results: &[SearchResult],
 ) -> std::io::Result<()> {
-    let mut file = std::fs::File::create(path)?;
-    writeln!(file, "query,file,file_type,match_number,context")?;
+    let file = std::fs::File::create(path)?;
+    let mut writer = std::io::BufWriter::new(file);
+    // Write UTF-8 BOM so Microsoft Excel on Windows parses UTF-8 correctly
+    writer.write_all(b"\xEF\xBB\xBF")?;
+    writeln!(writer, "query,file,file_type,match_number,context")?;
     for result in results {
         for (index, found_match) in result.matches.iter().enumerate() {
             writeln!(
-                file,
+                writer,
                 "{},{},{},{},{}",
                 csv_field(query),
                 csv_field(&result.file.to_string_lossy()),
@@ -627,6 +897,7 @@ fn save_results_csv(
             )?;
         }
     }
+    writer.flush()?;
     Ok(())
 }
 
@@ -689,9 +960,9 @@ impl eframe::App for DoXsearchApp {
                             ui.horizontal(|ui| {
                                 let browse_label = if self.lang == AppLanguage::Finnish { "Selaa..." } else { "Browse..." };
                                 if ui.button(browse_label).clicked() {
-                                    if let Some(path) = rfd::FileDialog::new()
-                                        .pick_folder()
-                                    {
+                                    let current_dir = resolve_directory_path(&self.directory_input);
+                                    let start = if current_dir.exists() { Some(current_dir.as_path()) } else { None };
+                                    if let Some(path) = pick_folder_dialog(start) {
                                         self.directory_input = path.to_string_lossy().to_string();
                                         self.error = None;
                                     }
@@ -838,21 +1109,31 @@ impl eframe::App for DoXsearchApp {
                             } else {
                                 if self.lang == AppLanguage::Finnish { "Hae" } else { "Search" }
                             };
+                            let cancel_btn_text = if self.lang == AppLanguage::Finnish { "Peruuta" } else { "Cancel" };
                             let clear_btn_text = if self.lang == AppLanguage::Finnish { "Tyhjennä" } else { "Clear" };
 
                             ui.horizontal(|ui| {
-                                if ui.add_enabled(
-                                    !searching,
-                                    egui::Button::new(
-                                        RichText::new(search_btn_text)
-                                            .font(FontId::proportional(15.0)).strong()
-                                    ).min_size(Vec2::new(115.0, 36.0))
-                                ).clicked() {
-                                    self.start_search();
+                                if searching {
+                                    if ui.add(
+                                        egui::Button::new(
+                                            RichText::new(cancel_btn_text)
+                                                .font(FontId::proportional(15.0)).strong().color(Color32::WHITE)
+                                        ).fill(RED_ACCENT).min_size(Vec2::new(115.0, 36.0))
+                                    ).clicked() {
+                                        self.cancel_search();
+                                    }
+                                } else {
+                                    if ui.add(
+                                        egui::Button::new(
+                                            RichText::new(search_btn_text)
+                                                .font(FontId::proportional(15.0)).strong()
+                                        ).min_size(Vec2::new(115.0, 36.0))
+                                    ).clicked() {
+                                        self.start_search();
+                                    }
                                 }
 
-                                if ui.add_enabled(
-                                    !searching,
+                                if ui.add(
                                     egui::Button::new(
                                         RichText::new(clear_btn_text)
                                             .font(FontId::proportional(15.0))
@@ -901,6 +1182,24 @@ impl eframe::App for DoXsearchApp {
                                     ui.label(RichText::new(no_matches_text).color(TEXT_MED));
                                 }
 
+                                if let Some(stats) = &self.last_search_stats {
+                                    let stats_text = if self.lang == AppLanguage::Finnish {
+                                        if stats.cached_count > 0 {
+                                            format!("Haettu {} tiedostoa ({} ms)\n⚡ {} luettu välimuistista", stats.total_count, stats.duration.as_millis(), stats.cached_count)
+                                        } else {
+                                            format!("Haettu {} tiedostoa ({} ms)", stats.total_count, stats.duration.as_millis())
+                                        }
+                                    } else {
+                                        if stats.cached_count > 0 {
+                                            format!("Searched {} files ({} ms)\n⚡ {} from cache", stats.total_count, stats.duration.as_millis(), stats.cached_count)
+                                        } else {
+                                            format!("Searched {} files ({} ms)", stats.total_count, stats.duration.as_millis())
+                                        }
+                                    };
+                                    ui.add_space(2.0);
+                                    ui.label(RichText::new(stats_text).font(FontId::proportional(11.0)).color(TEXT_MED));
+                                }
+
                                 if !self.errors.is_empty() {
                                     ui.add_space(8.0);
                                     ui.separator();
@@ -910,16 +1209,19 @@ impl eframe::App for DoXsearchApp {
                                     } else {
                                         format!("Errors ({})", self.errors.len())
                                     };
-                                    ui.label(RichText::new(errors_label)
-                                        .color(RED_ACCENT).strong());
-                                    
-                                    for err in &self.errors {
-                                        let fname = err.file.file_name()
-                                            .unwrap_or_default().to_string_lossy();
-                                        ui.label(RichText::new(format!("• {}: {}", fname, err.error))
-                                            .font(FontId::proportional(11.0))
-                                            .color(RED_ACCENT));
-                                    }
+                                    egui::CollapsingHeader::new(
+                                        RichText::new(errors_label).color(RED_ACCENT).strong()
+                                    )
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        for err in &self.errors {
+                                            let fname = err.file.file_name()
+                                                .unwrap_or_default().to_string_lossy();
+                                            ui.label(RichText::new(format!("• {}: {}", fname, err.error))
+                                                .font(FontId::proportional(11.0))
+                                                .color(RED_ACCENT));
+                                        }
+                                    });
                                 }
                             }
                         });
@@ -1282,7 +1584,17 @@ mod tests {
     }
 
     #[test]
-    fn test_save_results_csv_escapes_fields() {
+    fn test_clean_path_windows_prefix() {
+        let p = PathBuf::from(r"\\?\C:\Users\test\docs");
+        let cleaned = clean_path(p);
+        assert_eq!(cleaned, PathBuf::from(r"C:\Users\test\docs"));
+
+        let normal = PathBuf::from("/home/user/docs");
+        assert_eq!(clean_path(normal.clone()), normal);
+    }
+
+    #[test]
+    fn test_save_results_csv_escapes_fields_and_writes_bom() {
         let path = std::env::temp_dir().join(format!(
             "doxsearch-test-{}-results.csv",
             std::process::id()
@@ -1291,17 +1603,20 @@ mod tests {
             file: PathBuf::from("/tmp/a,\"b.pdf"),
             file_type: "PDF".to_string(),
             matches: vec![search::Match {
-                context: "first line, \"match\"".to_string(),
+                context: "first line, \"match\" with ääkköset".to_string(),
             }],
             modified: None,
         }];
 
         save_results_csv(&path, "term", &results).expect("CSV save failed");
-        let csv = std::fs::read_to_string(&path).expect("CSV read failed");
+        let bytes = std::fs::read(&path).expect("CSV read failed");
         std::fs::remove_file(&path).expect("CSV cleanup failed");
 
+        // Verify UTF-8 BOM is present
+        assert!(bytes.starts_with(&[0xEF, 0xBB, 0xBF]));
+        let csv = String::from_utf8(bytes[3..].to_vec()).expect("Valid UTF-8 after BOM");
         assert!(csv.contains("\"/tmp/a,\"\"b.pdf\""));
-        assert!(csv.contains("\"first line, \"\"match\"\"\""));
+        assert!(csv.contains("\"first line, \"\"match\"\" with ääkköset\""));
     }
 
     #[test]
@@ -1331,6 +1646,15 @@ mod tests {
     }
 
     #[test]
+    fn test_linux_file_manager_detection() {
+        let fm = detect_linux_file_manager();
+        // Check that detect_linux_file_manager returns a valid variant
+        let label = os_file_manager_name(AppLanguage::Finnish);
+        assert!(!label.is_empty());
+        let _ = fm;
+    }
+
+    #[test]
     fn test_user_directories_not_empty() {
         let home = get_user_home_dir();
         assert!(!home.as_os_str().is_empty());
@@ -1338,6 +1662,25 @@ mod tests {
         assert!(!docs.as_os_str().is_empty());
         let dl = get_user_downloads_dir();
         assert!(!dl.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn test_path_to_file_uri_encoding() {
+        let p1 = Path::new("/home/user/document.pdf");
+        assert_eq!(path_to_file_uri(p1), "file:///home/user/document.pdf");
+
+        let p2 = Path::new("/home/user/My Documents/report #1 (2025) 100%.pdf");
+        assert_eq!(
+            path_to_file_uri(p2),
+            "file:///home/user/My%20Documents/report%20%231%20%282025%29%20100%25.pdf"
+        );
+
+        let p3 = Path::new("/home/user/tiedosto_ääkköset.pdf");
+        // UTF-8 bytes for 'ä' is 0xC3 0xA4, 'ö' is 0xC3 0xB6
+        assert_eq!(
+            path_to_file_uri(p3),
+            "file:///home/user/tiedosto_%C3%A4%C3%A4kk%C3%B6set.pdf"
+        );
     }
 }
 
