@@ -3,7 +3,7 @@ mod search;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use eframe::egui;
 use egui::{Color32, FontId, RichText, Vec2};
-use search::{SearchError, SearchOptions, SearchResult};
+use search::{DocumentCache, SearchError, SearchOptions, SearchResult};
 use std::io::Write;
 use std::path::PathBuf;
 use std::thread;
@@ -91,6 +91,7 @@ struct DoXsearchApp {
     progress_count: (usize, usize),
     selected_result: Option<usize>,
     sort_order: SortOrder,
+    cache: DocumentCache,
     tx: Sender<SearchMessage>,
     rx: Receiver<SearchMessage>,
 }
@@ -112,6 +113,7 @@ impl DoXsearchApp {
             progress_count: (0, 0),
             selected_result: None,
             sort_order: SortOrder::DateDesc,
+            cache: DocumentCache::new(),
             tx,
             rx,
         }
@@ -167,6 +169,7 @@ impl DoXsearchApp {
         self.progress_count = (0, 0);
 
         let opts = self.opts.clone();
+        let cache = self.cache.clone();
         let tx = self.tx.clone();
         thread::spawn(move || {
             let tx_match = tx.clone();
@@ -174,6 +177,7 @@ impl DoXsearchApp {
             let tx_prog = tx.clone();
             match search::search_directory(
                 &opts,
+                &cache,
                 move |result| {
                     let _ = tx_match.send(SearchMessage::MatchFound(result));
                 },
@@ -371,6 +375,20 @@ impl eframe::App for DoXsearchApp {
                             ui.checkbox(&mut self.opts.ignore_case, "Ignore case");
                             ui.checkbox(&mut self.opts.recursive, "Recursive search");
                             ui.checkbox(&mut self.opts.search_hidden, "Search hidden folders");
+                            ui.checkbox(&mut self.opts.use_cache, "Use memory cache");
+                            ui.add_space(4.0);
+
+                            let cache_len = self.cache.len();
+                            let cache_bytes = self.cache.memory_usage_bytes();
+                            let cache_mb = cache_bytes as f64 / (1024.0 * 1024.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("Cache: {} files ({:.1} MB)", cache_len, cache_mb))
+                                    .font(FontId::proportional(11.0)).color(TEXT_MED));
+                                if cache_len > 0 && ui.small_button(RichText::new("Clear").color(RED_ACCENT)).clicked() {
+                                    self.cache.clear();
+                                }
+                            });
+                            ui.add_space(6.0);
                             ui.horizontal(|ui| {
                                 ftbtn(ui, &mut self.opts.search_docx, "DOCX", BLUE_MED);
                                 ftbtn(ui, &mut self.opts.search_odt,  "ODT",  GREEN);

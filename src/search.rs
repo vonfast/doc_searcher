@@ -4,9 +4,69 @@ use anyhow::{Context, Result};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use walkdir::WalkDir;
 use zip::ZipArchive;
+
+#[derive(Hash, PartialEq, Eq, Clone, Debug)]
+pub struct CacheKey {
+    pub path: PathBuf,
+    pub size: u64,
+    pub modified: Option<std::time::SystemTime>,
+}
+
+#[derive(Clone, Default)]
+pub struct DocumentCache {
+    entries: Arc<RwLock<HashMap<CacheKey, Arc<str>>>>,
+}
+
+impl DocumentCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, key: &CacheKey) -> Option<Arc<str>> {
+        let guard = self.entries.read().ok()?;
+        guard.get(key).cloned()
+    }
+
+    pub fn insert(&self, key: CacheKey, text: Arc<str>) {
+        if let Ok(mut guard) = self.entries.write() {
+            if guard.len() >= 1000 {
+                guard.clear();
+            }
+            guard.insert(key, text);
+        }
+    }
+
+    pub fn clear(&self) {
+        if let Ok(mut guard) = self.entries.write() {
+            guard.clear();
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.read().map(|g| g.len()).unwrap_or(0)
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn memory_usage_bytes(&self) -> usize {
+        if let Ok(guard) = self.entries.read() {
+            guard
+                .iter()
+                .map(|(k, v)| std::mem::size_of::<CacheKey>() + k.path.as_os_str().len() + v.len())
+                .sum()
+        } else {
+            0
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -34,6 +94,7 @@ pub struct SearchOptions {
     pub ignore_case: bool,
     pub recursive: bool,
     pub search_hidden: bool,
+    pub use_cache: bool,
     pub context_size: usize,
     pub search_docx: bool,
     pub search_odt: bool,
@@ -48,6 +109,7 @@ impl Default for SearchOptions {
             ignore_case: false,
             recursive: true,
             search_hidden: false,
+            use_cache: true,
             context_size: 150,
             search_docx: true,
             search_odt: true,
@@ -60,11 +122,13 @@ impl Default for SearchOptions {
 struct SearchCandidate {
     path: PathBuf,
     ext: String,
+    size: u64,
     modified: Option<std::time::SystemTime>,
 }
 
 pub fn search_directory(
     opts: &SearchOptions,
+    cache: &DocumentCache,
     on_match: impl Fn(SearchResult) + Sync + Send,
     on_error: impl Fn(SearchError) + Sync + Send,
     progress_cb: impl Fn(usize, usize) + Sync + Send,
@@ -112,11 +176,14 @@ pub fn search_directory(
                 return None;
             }
 
-            let modified = e.metadata().ok().and_then(|m| m.modified().ok());
+            let meta = e.metadata().ok();
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let modified = meta.and_then(|m| m.modified().ok());
 
             Some(SearchCandidate {
                 path: path.to_path_buf(),
                 ext,
+                size,
                 modified,
             })
         })
@@ -133,11 +200,38 @@ pub fn search_directory(
     entries
         .into_par_iter()
         .for_each(|candidate| {
-            let text_result = match candidate.ext.as_str() {
-                "docx" => extract_docx(&candidate.path),
-                "odt" => extract_odt(&candidate.path),
-                "pdf" => extract_pdf(&candidate.path),
-                _ => return,
+            let cache_key = CacheKey {
+                path: candidate.path.clone(),
+                size: candidate.size,
+                modified: candidate.modified,
+            };
+
+            let text_result: Result<Arc<str>> = if opts.use_cache {
+                if let Some(cached) = cache.get(&cache_key) {
+                    Ok(cached)
+                } else {
+                    let raw_res = match candidate.ext.as_str() {
+                        "docx" => extract_docx(&candidate.path),
+                        "odt" => extract_odt(&candidate.path),
+                        "pdf" => extract_pdf(&candidate.path),
+                        _ => return,
+                    };
+                    match raw_res {
+                        Ok(text) => {
+                            let arc_text: Arc<str> = text.into();
+                            cache.insert(cache_key, arc_text.clone());
+                            Ok(arc_text)
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            } else {
+                match candidate.ext.as_str() {
+                    "docx" => extract_docx(&candidate.path).map(|t| t.into()),
+                    "odt" => extract_odt(&candidate.path).map(|t| t.into()),
+                    "pdf" => extract_pdf(&candidate.path).map(|t| t.into()),
+                    _ => return,
+                }
             };
 
             let current = processed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -524,8 +618,72 @@ mod tests {
     fn test_search_options_default() {
         let opts = SearchOptions::default();
         assert!(!opts.search_hidden);
+        assert!(opts.use_cache);
         assert!(opts.search_docx);
         assert!(opts.search_odt);
         assert!(opts.search_pdf);
+    }
+
+    #[test]
+    fn test_cache_insert_and_get() {
+        let cache = DocumentCache::new();
+        let key = CacheKey {
+            path: PathBuf::from("/tmp/test.docx"),
+            size: 1024,
+            modified: None,
+        };
+        assert!(cache.get(&key).is_none());
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+
+        let text: Arc<str> = "Tämä on testisisältöä".into();
+        cache.insert(key.clone(), text.clone());
+
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.is_empty());
+        assert_eq!(cache.get(&key), Some(text));
+    }
+
+    #[test]
+    fn test_cache_invalidation_on_modified_or_size() {
+        let cache = DocumentCache::new();
+        let key1 = CacheKey {
+            path: PathBuf::from("/tmp/doc.docx"),
+            size: 1000,
+            modified: Some(std::time::UNIX_EPOCH),
+        };
+        cache.insert(key1.clone(), "Version 1".into());
+
+        // Same path, different size
+        let key2 = CacheKey {
+            path: PathBuf::from("/tmp/doc.docx"),
+            size: 1050,
+            modified: Some(std::time::UNIX_EPOCH),
+        };
+        assert!(cache.get(&key2).is_none());
+
+        // Same path, different modified time
+        let key3 = CacheKey {
+            path: PathBuf::from("/tmp/doc.docx"),
+            size: 1000,
+            modified: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(10)),
+        };
+        assert!(cache.get(&key3).is_none());
+    }
+
+    #[test]
+    fn test_cache_clear_and_memory() {
+        let cache = DocumentCache::new();
+        let key = CacheKey {
+            path: PathBuf::from("/tmp/doc.docx"),
+            size: 500,
+            modified: None,
+        };
+        cache.insert(key, "Content".into());
+        assert!(cache.memory_usage_bytes() > 0);
+
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.memory_usage_bytes(), 0);
     }
 }
