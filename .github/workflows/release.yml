@@ -46,16 +46,9 @@ jobs:
         run: |
           ./build_appimage.sh
 
-      - name: Release Linux
-        uses: softprops/action-gh-release@v2
-        if: github.event_name == 'push' || inputs.release_tag != ''
       - name: Upload Linux Artifact
         uses: actions/upload-artifact@v4
         with:
-          files: DoXsearch-x86_64.AppImage
-          tag_name: ${{ inputs.release_tag || github.ref_name }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           name: linux-appimage
           path: DoXsearch-x86_64.AppImage
           if-no-files-found: error
@@ -131,13 +124,9 @@ jobs:
           hdiutil create -volname "DoXsearch" -srcfolder target/dmg_stage -ov -format UDZO DoXsearch-macOS-Universal.dmg
           rm -rf target/dmg_stage
 
-      - name: Upload macOS Release Asset
-        uses: softprops/action-gh-release@v2
-        if: github.event_name == 'push' || inputs.release_tag != ''
       - name: Upload macOS Artifacts
         uses: actions/upload-artifact@v4
         with:
-          files: |
           name: macos-binaries
           path: |
             DoXsearch-macOS-Universal.zip

@@ -243,7 +243,6 @@ pub fn search_directory(
                     .and_then(|ext| ext.to_str())
                     .unwrap_or("")
                     .to_lowercase();
-                
 
                 let matches_type = match ext.as_str() {
                     "docx" => opts.search_docx,
@@ -277,7 +276,6 @@ pub fn search_directory(
             let modified = meta.and_then(|m| m.modified().ok());
 
             if let Some(max_mb) = opts.max_file_size_mb {
-                if size > max_mb * 1024 * 1024 {
                 let max_bytes = max_mb.saturating_mul(1024 * 1024);
                 if size > max_bytes {
                     return None;
@@ -362,7 +360,6 @@ pub fn search_directory(
             };
 
             let current = processed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if current % step == 0 || current == total {
             if current.is_multiple_of(step) || current == total {
                 progress_cb(current, total);
             }
@@ -455,15 +452,6 @@ pub fn extract_docx(path: &Path) -> Result<String> {
 
     let mut full_text = String::with_capacity(4096);
     for xml_name in xml_names {
-        if let Ok(entry) = archive.by_name(&xml_name) {
-            let reader = Reader::from_reader(std::io::BufReader::new(entry));
-            if let Ok(part_text) = extract_text_from_xml_reader(reader, true) {
-                if !part_text.trim().is_empty() {
-                    if !full_text.is_empty() && !full_text.ends_with('\n') {
-                        full_text.push('\n');
-                    }
-                    full_text.push_str(&part_text);
-                }
         let entry = archive
             .by_name(&xml_name)
             .with_context(|| format!("Could not read part {xml_name} in docx: {}", path.display()))?;
@@ -491,14 +479,6 @@ pub fn extract_odt(path: &Path) -> Result<String> {
     let mut full_text = String::with_capacity(4096);
 
     // 1. content.xml (main document body)
-    if let Ok(doc) = archive.by_name("content.xml") {
-        let reader = Reader::from_reader(std::io::BufReader::new(doc));
-        if let Ok(body_text) = extract_text_from_xml_reader(reader, false) {
-            full_text.push_str(&body_text);
-        }
-    } else {
-        return Err(anyhow::anyhow!("content.xml missing from odt: {}", path.display()));
-    }
     let doc = archive
         .by_name("content.xml")
         .with_context(|| format!("content.xml missing from odt: {}", path.display()))?;
@@ -510,12 +490,6 @@ pub fn extract_odt(path: &Path) -> Result<String> {
     // 2. styles.xml (contains headers and footers in ODT)
     if let Ok(styles) = archive.by_name("styles.xml") {
         let reader = Reader::from_reader(std::io::BufReader::new(styles));
-        if let Ok(style_text) = extract_text_from_xml_reader(reader, false) {
-            if !style_text.trim().is_empty() {
-                if !full_text.is_empty() && !full_text.ends_with('\n') {
-                    full_text.push('\n');
-                }
-                full_text.push_str(&style_text);
         let style_text = extract_text_from_xml_reader(reader, false)
             .with_context(|| format!("Error reading styles.xml in odt: {}", path.display()))?;
         if !style_text.trim().is_empty() {
@@ -622,7 +596,6 @@ pub fn extract_text_from_xml_reader<R: std::io::BufRead>(
                 }
             }
             Ok(Event::Eof) => break,
-            Err(_) => break,
             Err(e) => return Err(anyhow::anyhow!("XML parse error: {e}")),
             _ => {}
         }
@@ -671,11 +644,8 @@ pub fn extract_pdf(path: &Path) -> Result<String> {
         return Err(anyhow::anyhow!("Tiedosto ei ole kelvollinen PDF (puuttuva %PDF-otsake)"));
     };
 
-    // 2. Try standard pdf-extract in-memory
-    let mem_bytes = pdf_bytes.to_vec();
     // 2. Try standard pdf-extract in-memory directly from the byte slice
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        pdf_extract::extract_text_from_mem(&mem_bytes)
         pdf_extract::extract_text_from_mem(pdf_bytes)
     }));
 
@@ -715,21 +685,14 @@ fn extract_pdf_fallback(bytes: &[u8]) -> Option<String> {
             if let Some(end_pos) = bytes[stream_start..].windows(9).position(|w| w == b"endstream") {
                 let stream_bytes = &bytes[stream_start..stream_start + end_pos];
 
-                // Try decompressing as zlib/flate
-                let mut buf = Vec::new();
                 // Try decompressing as zlib/flate reusing pre-allocated buffers
                 zlib_buf.clear();
                 let mut decoder = flate2::read::ZlibDecoder::new(stream_bytes);
-                let decompressed = if decoder.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-                    Some(buf)
                 let decompressed = if decoder.read_to_end(&mut zlib_buf).is_ok() && !zlib_buf.is_empty() {
                     Some(&zlib_buf[..])
                 } else {
-                    let mut buf2 = Vec::new();
                     deflate_buf.clear();
                     let mut decoder2 = flate2::read::DeflateDecoder::new(stream_bytes);
-                    if decoder2.read_to_end(&mut buf2).is_ok() && !buf2.is_empty() {
-                        Some(buf2)
                     if decoder2.read_to_end(&mut deflate_buf).is_ok() && !deflate_buf.is_empty() {
                         Some(&deflate_buf[..])
                     } else {
@@ -737,7 +700,6 @@ fn extract_pdf_fallback(bytes: &[u8]) -> Option<String> {
                     }
                 };
 
-                let stream_content = decompressed.as_deref().unwrap_or(stream_bytes);
                 let stream_content = decompressed.unwrap_or(stream_bytes);
                 extract_text_from_pdf_stream(stream_content, &mut extracted_text);
 
