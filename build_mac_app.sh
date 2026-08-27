@@ -28,7 +28,8 @@ if [ -f "$BINARY_PATH" ]; then
     chmod +x "$MACOS_DIR/doxsearch"
     echo "Copied binary from $BINARY_PATH"
 else
-    echo "Executable binary missing. Run cargo build --release first."
+    echo "Executable binary missing. Run cargo build --release first." >&2
+    exit 1
 fi
 
 cat <<EOF > "$CONTENTS_DIR/Info.plist"
