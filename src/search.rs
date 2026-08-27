@@ -227,7 +227,7 @@ pub fn search_directory(
                     "docx" | "docm" | "dotx" | "dotm" => opts.search_docx,
                     "odt" | "ott" | "ods" | "odp" | "fodt" | "fods" => opts.search_odt,
                     "pdf" => opts.search_pdf,
-                    "txt" | "text" | "md" | "markdown" | "csv" | "tsv" | "log" | "json" | "xml" | "html" | "htm" | "yaml" | "yml" | "ini" | "conf" | "cfg" | "toml" | "rst" => opts.search_txt,
+                    "txt" | "text" => opts.search_txt,
                     _ => false,
                 };
 
@@ -316,7 +316,7 @@ pub fn search_directory(
                         "docx" | "docm" | "dotx" | "dotm" => extract_docx(&candidate.path),
                         "odt" | "ott" | "ods" | "odp" => extract_odt(&candidate.path),
                         "pdf" => extract_pdf(&candidate.path),
-                        "txt" | "text" | "md" | "markdown" | "csv" | "tsv" | "log" | "json" | "xml" | "html" | "htm" | "yaml" | "yml" | "ini" | "conf" | "cfg" | "toml" | "rst" => extract_plain_text(&candidate.path),
+                        "txt" | "text" => extract_plain_text(&candidate.path),
                         _ => return,
                     };
                     match raw_res {
@@ -334,7 +334,7 @@ pub fn search_directory(
                     "docx" | "docm" | "dotx" | "dotm" => extract_docx(&candidate.path).map(|t| t.into()),
                     "odt" | "ott" | "ods" | "odp" => extract_odt(&candidate.path).map(|t| t.into()),
                     "pdf" => extract_pdf(&candidate.path).map(|t| t.into()),
-                    "txt" | "text" | "md" | "markdown" | "csv" | "tsv" | "log" | "json" | "xml" | "html" | "htm" | "yaml" | "yml" | "ini" | "conf" | "cfg" | "toml" | "rst" => extract_plain_text(&candidate.path).map(|t| t.into()),
+                    "txt" | "text" => extract_plain_text(&candidate.path).map(|t| t.into()),
                     _ => return,
                 }
             };
@@ -348,7 +348,14 @@ pub fn search_directory(
                 Ok(text) => {
                     let matches = find_matches(&text, &opts.query, opts.ignore_case, opts.context_size);
                     if !matches.is_empty() {
-                        let display_type = candidate.ext.to_uppercase();
+                        let display_type = match candidate.ext.as_str() {
+                            "docx" | "docm" | "dotx" | "dotm" => "DOCX".to_string(),
+                            "odt" | "ott" | "ods" | "odp" => "ODT".to_string(),
+                            "fodt" | "fods" => "FODT".to_string(),
+                            "pdf" => "PDF".to_string(),
+                            "txt" | "text" => "TXT".to_string(),
+                            _ => candidate.ext.to_uppercase(),
+                        };
                         on_match(SearchResult {
                             file: candidate.path,
                             file_type: display_type,
@@ -1435,18 +1442,33 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("doxsearch_multi_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&temp_dir);
 
-        // 1. Plain text file
+        // 1. Plain text file (.txt)
         let txt_path = temp_dir.join("sample.txt");
         std::fs::write(&txt_path, "Tämä on hakutermi tekstissä").unwrap();
 
-        // 2. Markdown file
-        let md_path = temp_dir.join("notes.md");
-        std::fs::write(&md_path, "Muistiinpanot: hakutermi löytyy täältä").unwrap();
+        // 2. Plain text file (.text)
+        let text_path = temp_dir.join("notes.text");
+        std::fs::write(&text_path, "Muistiinpanot: hakutermi löytyy täältä").unwrap();
 
-        // 3. Mock PDF file with stream text
+        // 3. Flat ODF XML (.fodt)
+        let fodt_path = temp_dir.join("document.fodt");
+        let xml_content = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+                         xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+            <office:body><office:text><text:p>Tämä on hakutermi ODF-dokumentissa</text:p></office:text></office:body>
+        </office:document>"#;
+        std::fs::write(&fodt_path, xml_content).unwrap();
+
+        // 4. Mock PDF file with stream text
         let pdf_path = temp_dir.join("doc.pdf");
         let pdf_content = b"%PDF-1.4\n1 0 obj\n<< /Length 50 >>\nstream\nBT (hakutermi pdf-tiedostossa) Tj ET\nendstream\nendobj\n%%EOF";
         std::fs::write(&pdf_path, pdf_content).unwrap();
+
+        // 5. Config/code file (.json, .md) that must be IGNORED
+        let json_path = temp_dir.join("config.json");
+        std::fs::write(&json_path, "{\"data\": \"hakutermi jsonissa\"}").unwrap();
+        let md_path = temp_dir.join("readme.md");
+        std::fs::write(&md_path, "# hakutermi markdownissa").unwrap();
 
         let cache = DocumentCache::new();
         let opts = SearchOptions {
@@ -1474,11 +1496,12 @@ mod tests {
         ).unwrap();
 
         let results = matches_found.lock().unwrap();
-        assert_eq!(results.len(), 3, "All 3 supported format files must be found");
+        assert_eq!(results.len(), 4, "Should only find 4 supported files (2 TXT, 1 FODT, 1 PDF), ignoring .json and .md");
         let types: Vec<String> = results.iter().map(|r| r.file_type.clone()).collect();
-        assert!(types.contains(&"TXT".to_string()) || types.contains(&"MD".to_string()));
+        assert_eq!(types.iter().filter(|t| *t == "TXT").count(), 2);
         assert!(types.contains(&"PDF".to_string()));
-        assert_eq!(stats.total_count, 3);
+        assert!(types.contains(&"FODT".to_string()));
+        assert_eq!(stats.total_count, 4);
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -1654,14 +1677,13 @@ mod tests {
         let txt_a = dir_a.join("notes_a.txt");
         std::fs::write(&txt_a, "etsittava_termi teksti A").unwrap();
 
-        // Directory B files: PDF, MD (text), Flat ODF XML
+        // Directory B files: PDF, TXT, Flat ODF XML
         let pdf_b = dir_b.join("doc_b.pdf");
         let pdf_content_b = b"%PDF-1.4\n1 0 obj\n<< /Length 50 >>\nstream\nBT (etsittava_termi pdf B) Tj ET\nendstream\nendobj\n%%EOF";
         std::fs::write(&pdf_b, pdf_content_b).unwrap();
-        eprintln!("Direct extract_pdf on pdf_b: {:?}", extract_pdf(&pdf_b));
 
-        let md_b = dir_b.join("readme_b.md");
-        std::fs::write(&md_b, "etsittava_termi markdown B").unwrap();
+        let txt_b = dir_b.join("readme_b.txt");
+        std::fs::write(&txt_b, "etsittava_termi teksti B").unwrap();
 
         let fodt_b = dir_b.join("letter_b.fodt");
         let fodt_content = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1707,13 +1729,59 @@ mod tests {
         ).unwrap();
 
         let results_b = matches_b.lock().unwrap();
-        assert_eq!(results_b.len(), 3, "Dir B should find PDF, MD, and FODT (not just txt)");
+        assert_eq!(results_b.len(), 3, "Dir B should find PDF, TXT, and FODT");
         let types_b: Vec<String> = results_b.iter().map(|r| r.file_type.clone()).collect();
         assert!(types_b.contains(&"PDF".to_string()));
-        assert!(types_b.contains(&"MD".to_string()));
+        assert!(types_b.contains(&"TXT".to_string()));
         assert!(types_b.contains(&"FODT".to_string()));
         assert_eq!(stats_b.total_count, 3);
 
         let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn test_non_txt_files_are_strictly_ignored() {
+        let temp_dir = std::env::temp_dir().join(format!("doxsearch_strict_txt_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        // Files that should NOT be matched:
+        let extensions = ["json", "toml", "yaml", "yml", "xml", "html", "htm", "csv", "tsv", "log", "md", "markdown", "ini", "conf", "cfg", "rst", "rs", "py", "sh"];
+        for ext in &extensions {
+            let p = temp_dir.join(format!("file.{}", ext));
+            std::fs::write(&p, "salasana123").unwrap();
+        }
+
+        // Only this .txt file should be matched:
+        let valid_txt = temp_dir.join("actual_doc.txt");
+        std::fs::write(&valid_txt, "salasana123 tekstissä").unwrap();
+
+        let cache = DocumentCache::new();
+        let opts = SearchOptions {
+            directory: temp_dir.clone(),
+            query: "salasana123".to_string(),
+            search_docx: true,
+            search_odt: true,
+            search_pdf: true,
+            search_txt: true,
+            ..Default::default()
+        };
+
+        let matches_found = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let m_clone = matches_found.clone();
+        let stats = search_directory(
+            &opts,
+            &cache,
+            None,
+            move |r| m_clone.lock().unwrap().push(r),
+            |_| {},
+            |_, _| {},
+        ).unwrap();
+
+        let results = matches_found.lock().unwrap();
+        assert_eq!(results.len(), 1, "Only actual_doc.txt should match, all other extensions must be ignored");
+        assert_eq!(results[0].file_type, "TXT");
+        assert_eq!(stats.total_count, 1);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }
