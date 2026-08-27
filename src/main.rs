@@ -4,6 +4,8 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use eframe::egui;
 use egui::{Color32, FontId, RichText, Vec2};
 use search::{DocumentCache, SearchError, SearchOptions, SearchResult};
+use std::io::Write;
+use std::path::PathBuf;
 use std::thread;
 
 const BLUE_DARK:  Color32 = Color32::from_rgb(30,  58,  138);
@@ -90,6 +92,7 @@ struct DoXsearchApp {
     selected_result: Option<usize>,
     sort_order: SortOrder,
     cache: DocumentCache,
+    tx: Sender<SearchMessage>,
     rx: Receiver<SearchMessage>,
 }
 
@@ -111,6 +114,8 @@ impl DoXsearchApp {
             selected_result: None,
             sort_order: SortOrder::DateDesc,
             cache: DocumentCache::new(),
+            tx,
+            rx,
         }
     }
 
@@ -165,6 +170,7 @@ impl DoXsearchApp {
 
         let opts = self.opts.clone();
         let cache = self.cache.clone();
+        let tx = self.tx.clone();
         thread::spawn(move || {
             let tx_match = tx.clone();
             let tx_err = tx.clone();
@@ -172,6 +178,7 @@ impl DoXsearchApp {
             match search::search_directory(
                 &opts,
                 &cache,
+                move |result| {
                     let _ = tx_match.send(SearchMessage::MatchFound(result));
                 },
                 move |error| {
@@ -245,6 +252,54 @@ impl DoXsearchApp {
     fn total_matches(&self) -> usize {
         self.results.iter().map(|r| r.matches.len()).sum()
     }
+
+    fn save_results(&mut self) {
+        if self.results.is_empty() {
+            self.error = Some("There are no results to save.".to_string());
+            return;
+        }
+
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name("doxsearch-results.csv")
+            .add_filter("CSV files", &["csv"])
+            .save_file()
+        else {
+            return;
+        };
+
+        match save_results_csv(&path, &self.opts.query, &self.results) {
+            Ok(()) => self.error = Some(format!("Results saved to {}", path.display())),
+            Err(e) => self.error = Some(format!("Failed to save results: {e}")),
+        }
+    }
+}
+
+fn csv_field(value: &str) -> String {
+    let escaped = value.replace('"', "\"\"");
+    format!("\"{escaped}\"")
+}
+
+fn save_results_csv(
+    path: &std::path::Path,
+    query: &str,
+    results: &[SearchResult],
+) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    writeln!(file, "query,file,file_type,match_number,context")?;
+    for result in results {
+        for (index, found_match) in result.matches.iter().enumerate() {
+            writeln!(
+                file,
+                "{},{},{},{},{}",
+                csv_field(query),
+                csv_field(&result.file.to_string_lossy()),
+                csv_field(&result.file_type),
+                index + 1,
+                csv_field(&found_match.context)
+            )?;
+        }
+    }
+    Ok(())
 }
 
 impl eframe::App for DoXsearchApp {
@@ -322,7 +377,6 @@ impl eframe::App for DoXsearchApp {
                             ui.checkbox(&mut self.opts.search_hidden, "Search hidden folders");
                             ui.checkbox(&mut self.opts.use_cache, "Use memory cache");
 
-                            let cache_len = self.cache.len();
                             ui.horizontal(|ui| {
                                 ftbtn(ui, &mut self.opts.search_docx, "DOCX", BLUE_MED);
                                 ftbtn(ui, &mut self.opts.search_odt,  "ODT",  GREEN);
@@ -376,6 +430,9 @@ impl eframe::App for DoXsearchApp {
 
                             if self.state == SearchState::Done {
                                 ui.add_space(12.0);
+                                if ui.button("Save results...").clicked() {
+                                    self.save_results();
+                                }
                                 let total = self.total_matches();
                                 if total > 0 {
                                     ui.label(RichText::new(
@@ -695,6 +752,29 @@ mod tests {
     fn test_resolve_directory_path_quoted() {
         let resolved = resolve_directory_path("'/tmp/test'");
         assert_eq!(resolved, PathBuf::from("/tmp/test"));
+    }
+
+    #[test]
+    fn test_save_results_csv_escapes_fields() {
+        let path = std::env::temp_dir().join(format!(
+            "doxsearch-test-{}-results.csv",
+            std::process::id()
+        ));
+        let results = vec![SearchResult {
+            file: PathBuf::from("/tmp/a,\"b.pdf"),
+            file_type: "PDF".to_string(),
+            matches: vec![search::Match {
+                context: "first line, \"match\"".to_string(),
+            }],
+            modified: None,
+        }];
+
+        save_results_csv(&path, "term", &results).expect("CSV save failed");
+        let csv = std::fs::read_to_string(&path).expect("CSV read failed");
+        std::fs::remove_file(&path).expect("CSV cleanup failed");
+
+        assert!(csv.contains("\"/tmp/a,\"\"b.pdf\""));
+        assert!(csv.contains("\"first line, \"\"match\"\"\""));
     }
 }
 
