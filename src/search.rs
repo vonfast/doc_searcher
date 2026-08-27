@@ -6,9 +6,48 @@ use quick_xml::reader::Reader;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use walkdir::WalkDir;
 use zip::ZipArchive;
+
+struct Semaphore {
+    max: usize,
+    count: Mutex<usize>,
+    cvar: Condvar,
+}
+
+impl Semaphore {
+    fn new(max: usize) -> Self {
+        Self {
+            max,
+            count: Mutex::new(0),
+            cvar: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> SemaphoreGuard<'_> {
+        let mut count = self.count.lock().unwrap_or_else(|e| e.into_inner());
+        while *count >= self.max {
+            count = self.cvar.wait(count).unwrap_or_else(|e| e.into_inner());
+        }
+        *count += 1;
+        SemaphoreGuard { sem: self }
+    }
+}
+
+struct SemaphoreGuard<'a> {
+    sem: &'a Semaphore,
+}
+
+impl<'a> Drop for SemaphoreGuard<'a> {
+    fn drop(&mut self) {
+        let mut count = self.sem.count.lock().unwrap_or_else(|e| e.into_inner());
+        *count = count.saturating_sub(1);
+        self.sem.cvar.notify_one();
+    }
+}
+
+static PDF_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
 
 #[derive(Hash, PartialEq, Eq, Clone, Debug)]
 pub struct CacheKey {
@@ -33,6 +72,10 @@ impl DocumentCache {
     }
 
     pub fn insert(&self, key: CacheKey, text: Arc<str>) {
+        // Only cache documents up to 5 MB of text to prevent memory ballooning
+        if text.len() > 5 * 1024 * 1024 {
+            return;
+        }
         if let Ok(mut guard) = self.entries.write() {
             if guard.len() >= 1000 {
                 guard.clear();
@@ -99,6 +142,9 @@ pub struct SearchOptions {
     pub search_docx: bool,
     pub search_odt: bool,
     pub search_pdf: bool,
+    pub search_txt: bool,
+    pub max_file_size_mb: Option<u64>,
+    pub modified_after: Option<std::time::SystemTime>,
 }
 
 impl Default for SearchOptions {
@@ -114,6 +160,9 @@ impl Default for SearchOptions {
             search_docx: true,
             search_odt: true,
             search_pdf: true,
+            search_txt: true,
+            max_file_size_mb: None,
+            modified_after: None,
         }
     }
 }
@@ -147,7 +196,22 @@ pub fn search_directory(
                 if !opts.search_hidden && name.starts_with('.') {
                     return false;
                 }
-                if name == "node_modules" || name == "target" || name == "__pycache__" {
+                if name == "node_modules"
+                    || name == "target"
+                    || name == "__pycache__"
+                    || name == "venv"
+                    || name == ".venv"
+                    || name == ".cargo"
+                    || name == ".rustup"
+                    || name == ".local"
+                    || name == ".cache"
+                    || name == ".var"
+                    || name == ".mozilla"
+                    || name == ".steam"
+                    || name == ".wine"
+                    || name == ".flatpak"
+                    || name == "build"
+                {
                     return false;
                 }
             }
@@ -169,6 +233,7 @@ pub fn search_directory(
                 "docx" => opts.search_docx,
                 "odt" => opts.search_odt,
                 "pdf" => opts.search_pdf,
+                "txt" | "md" | "csv" | "log" | "json" => opts.search_txt,
                 _ => false,
             };
 
@@ -179,6 +244,20 @@ pub fn search_directory(
             let meta = e.metadata().ok();
             let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
             let modified = meta.and_then(|m| m.modified().ok());
+
+            if let Some(max_mb) = opts.max_file_size_mb {
+                if size > max_mb * 1024 * 1024 {
+                    return None;
+                }
+            }
+
+            if let Some(after) = opts.modified_after {
+                if let Some(mtime) = modified {
+                    if mtime < after {
+                        return None;
+                    }
+                }
+            }
 
             Some(SearchCandidate {
                 path: path.to_path_buf(),
@@ -214,6 +293,7 @@ pub fn search_directory(
                         "docx" => extract_docx(&candidate.path),
                         "odt" => extract_odt(&candidate.path),
                         "pdf" => extract_pdf(&candidate.path),
+                        "txt" | "md" | "csv" | "log" | "json" => extract_plain_text(&candidate.path),
                         _ => return,
                     };
                     match raw_res {
@@ -230,6 +310,7 @@ pub fn search_directory(
                     "docx" => extract_docx(&candidate.path).map(|t| t.into()),
                     "odt" => extract_odt(&candidate.path).map(|t| t.into()),
                     "pdf" => extract_pdf(&candidate.path).map(|t| t.into()),
+                    "txt" | "md" | "csv" | "log" | "json" => extract_plain_text(&candidate.path).map(|t| t.into()),
                     _ => return,
                 }
             };
@@ -261,6 +342,13 @@ pub fn search_directory(
         });
 
     Ok(())
+}
+
+/// Extract text from plain text files (.txt, .md, .csv, .log, .json)
+pub fn extract_plain_text(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("Could not read file: {}", path.display()))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Extract text from a .docx file using streaming XML reader
@@ -399,10 +487,22 @@ pub fn extract_text_from_xml(xml: &str) -> Result<String> {
     extract_text_from_xml_reader(reader, is_docx)
 }
 
-/// Extract text from a .pdf file
+/// Extract text from a .pdf file with concurrency throttling and panic safety
 pub fn extract_pdf(path: &Path) -> Result<String> {
-    pdf_extract::extract_text(path)
-        .with_context(|| format!("PDF text extraction failed: {}", path.display()))
+    // Limit concurrent PDF parsing to at most 2 threads to prevent massive RAM spikes (OOM)
+    let sem = PDF_SEMAPHORE.get_or_init(|| Semaphore::new(2));
+    let _guard = sem.acquire();
+
+    let path_buf = path.to_path_buf();
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pdf_extract::extract_text(&path_buf)
+    }));
+
+    match res {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(e)) => Err(anyhow::anyhow!("PDF text extraction failed on {}: {e}", path.display())),
+        Err(_) => Err(anyhow::anyhow!("PDF text extraction panicked on corrupted font/stream in {}", path.display())),
+    }
 }
 
 pub fn floor_char_boundary(text: &str, mut index: usize) -> usize {
@@ -622,6 +722,21 @@ mod tests {
         assert!(opts.search_docx);
         assert!(opts.search_odt);
         assert!(opts.search_pdf);
+        assert!(opts.search_txt);
+        assert!(opts.max_file_size_mb.is_none());
+        assert!(opts.modified_after.is_none());
+    }
+
+    #[test]
+    fn test_extract_plain_text_from_tempfile() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("doxsearch_test_plain.txt");
+        std::fs::write(&test_file, "Tämä on puhdasta tekstiä testiin.\nToinen rivi.").expect("write failed");
+
+        let extracted = extract_plain_text(&test_file).expect("extract failed");
+        assert!(extracted.contains("puhdasta tekstiä"));
+
+        let _ = std::fs::remove_file(test_file);
     }
 
     #[test]
