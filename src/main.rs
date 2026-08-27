@@ -5,7 +5,6 @@ use eframe::egui;
 use egui::{Color32, FontId, RichText, Vec2};
 use search::{DocumentCache, SearchError, SearchOptions, SearchResult, SearchStats};
 use std::io::Write;
-use std::path::PathBuf;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::thread;
@@ -487,7 +486,6 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
         }
 
         // 2. Try DBus org.freedesktop.FileManager1.ShowItems
-        let uri = format!("file://{}", canonical.display());
         let uri = path_to_file_uri(&canonical);
         let dbus_result = std::process::Command::new("dbus-send")
             .args([
