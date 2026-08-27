@@ -3,7 +3,7 @@ name = "doxsearch"
 version = "0.2.0"
 edition = "2021"
 authors = ["Petri <vonfast@gmail.com>"]
-description = "A simple desktop tool for searching text in PDF, DOCX, and ODT files."
+description = "A simple desktop tool for searching text in PDF, DOCX, ODT, and text files."
 repository = "https://github.com/vonfast/doc_searcher"
 license = "MIT"
 
@@ -53,9 +53,9 @@ auto_link_exclude_list = ["libc.so*", "libpthread.so*"]
 [package.metadata.bundle]
 name = "DoXsearch"
 identifier = "com.vonfast.doxsearch"
-icon = ["assets/doxgrep.png"]
+icon = ["assets/doxsearch.png"]
 version = "0.2.0"
 copyright = "Copyright © 2026 Petri"
 category = "Utility"
-short_description = "A simple desktop tool for searching text in PDF, DOCX, and ODT files."
+short_description = "A simple desktop tool for searching text in PDF, DOCX, ODT, and text files."
 

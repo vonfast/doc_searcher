@@ -33,11 +33,14 @@ cp doxsearch.desktop "$APPDIR/usr/share/applications/"
 cp doxsearch.desktop "$APPDIR/"
 
 # Copy icon (if exists)
-if [ -f "assets/doxgrep.png" ]; then
-    cp assets/doxgrep.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/"
+if [ -f "assets/doxsearch.png" ]; then
+    cp assets/doxsearch.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/doxsearch.png"
+    cp assets/doxsearch.png "$APPDIR/doxsearch.png"
+elif [ -f "assets/doxgrep.png" ]; then
+    cp assets/doxgrep.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/doxsearch.png"
     cp assets/doxgrep.png "$APPDIR/doxsearch.png"
 else
-    echo "Warning: assets/doxgrep.png missing. Creating a dummy file so appimagetool can proceed."
+    echo "Warning: assets/doxsearch.png missing. Creating a dummy file so appimagetool can proceed."
     touch "$APPDIR/doxsearch.png"
 fi
 

@@ -167,7 +167,7 @@ impl SizeFilter {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum SearchState { Idle, Searching, Done }
 
 pub fn os_name() -> &'static str {
@@ -584,6 +584,7 @@ struct DoXsearchApp {
     results: Vec<SearchResult>,
     errors: Vec<SearchError>,
     error: Option<String>,
+    status_info: Option<String>,
     progress_count: (usize, usize),
     selected_result: Option<usize>,
     sort_order: SortOrder,
@@ -611,6 +612,7 @@ impl DoXsearchApp {
             results: Vec::new(),
             errors: Vec::new(),
             error: None,
+            status_info: None,
             progress_count: (0, 0),
             selected_result: None,
             sort_order: SortOrder::DateDesc,
@@ -632,9 +634,19 @@ impl DoXsearchApp {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.cancel_flag = None;
+        self.current_search_id += 1;
         if self.state == SearchState::Searching {
-            self.state = SearchState::Idle;
+            self.state = if self.results.is_empty() {
+                SearchState::Idle
+            } else {
+                SearchState::Done
+            };
             self.progress_count = (0, 0);
+            self.status_info = Some(if self.lang == AppLanguage::Finnish {
+                "Haku peruutettu.".to_string()
+            } else {
+                "Search cancelled.".to_string()
+            });
         }
     }
 
@@ -643,20 +655,30 @@ impl DoXsearchApp {
 
         match self.sort_order {
             SortOrder::DateDesc => {
-                self.results.sort_by(|a, b| b.modified.cmp(&a.modified));
+                self.results.sort_by(|a, b| match (b.modified, a.modified) {
+                    (Some(tb), Some(ta)) => tb.cmp(&ta).then_with(|| a.file.cmp(&b.file)),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.file.cmp(&b.file),
+                });
             }
             SortOrder::DateAsc => {
-                self.results.sort_by(|a, b| a.modified.cmp(&b.modified));
+                self.results.sort_by(|a, b| match (a.modified, b.modified) {
+                    (Some(ta), Some(tb)) => ta.cmp(&tb).then_with(|| a.file.cmp(&b.file)),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.file.cmp(&b.file),
+                });
             }
             SortOrder::Name => {
                 self.results.sort_by(|a, b| {
                     let name_a = a.file.file_name().map(|n| n.to_string_lossy().to_lowercase());
                     let name_b = b.file.file_name().map(|n| n.to_string_lossy().to_lowercase());
-                    name_a.cmp(&name_b)
+                    name_a.cmp(&name_b).then_with(|| a.file.cmp(&b.file))
                 });
             }
             SortOrder::Matches => {
-                self.results.sort_by(|a, b| b.matches.len().cmp(&a.matches.len()));
+                self.results.sort_by(|a, b| b.matches.len().cmp(&a.matches.len()).then_with(|| a.file.cmp(&b.file)));
             }
         }
 
@@ -675,6 +697,7 @@ impl DoXsearchApp {
             } else {
                 "Please enter a search term first.".to_string()
             });
+            self.status_info = None;
             return;
         }
         if !self.opts.search_docx && !self.opts.search_odt && !self.opts.search_pdf && !self.opts.search_txt {
@@ -683,6 +706,7 @@ impl DoXsearchApp {
             } else {
                 "Please select at least one file type (DOCX, ODT, PDF, TXT).".to_string()
             });
+            self.status_info = None;
             return;
         }
 
@@ -693,16 +717,18 @@ impl DoXsearchApp {
             } else {
                 format!("Directory not found: {}", self.directory_input)
             });
+            self.status_info = None;
             return;
         }
 
-        // Add to recent directories
+        // Add to recent directories (MRU order)
         let dir_str = self.directory_input.clone();
-        if !self.recent_directories.contains(&dir_str) {
-            self.recent_directories.insert(0, dir_str);
-            if self.recent_directories.len() > 6 {
-                self.recent_directories.pop();
-            }
+        if let Some(pos) = self.recent_directories.iter().position(|d| d == &dir_str) {
+            self.recent_directories.remove(pos);
+        }
+        self.recent_directories.insert(0, dir_str);
+        if self.recent_directories.len() > 6 {
+            self.recent_directories.pop();
         }
 
         self.opts.modified_after = self.date_filter.to_system_time();
@@ -717,6 +743,7 @@ impl DoXsearchApp {
         self.results.clear();
         self.errors.clear();
         self.error = None;
+        self.status_info = None;
         self.selected_result = None;
         self.progress_count = (0, 0);
 
@@ -767,6 +794,7 @@ impl DoXsearchApp {
         self.opts.query.clear();
         self.state = SearchState::Idle;
         self.error = None;
+        self.status_info = None;
         self.progress_count = (0, 0);
         self.selected_result = None;
         self.last_search_stats = None;
@@ -815,12 +843,13 @@ impl DoXsearchApp {
                 SearchMessage::Error { search_id, message } => {
                     if search_id == self.current_search_id {
                         self.error = Some(message);
+                        self.status_info = None;
                         self.state = SearchState::Idle;
                     }
                 }
             }
         }
-        if new_matches {
+        if new_matches && self.results.len() <= 200 {
             self.sort_results();
         }
         // Ensure selected_result is valid and within bounds
@@ -845,6 +874,7 @@ impl DoXsearchApp {
             } else {
                 "There are no results to save.".to_string()
             });
+            self.status_info = None;
             return;
         }
 
@@ -853,16 +883,22 @@ impl DoXsearchApp {
         };
 
         match save_results_csv(&path, &self.opts.query, &self.results) {
-            Ok(()) => self.error = Some(if self.lang == AppLanguage::Finnish {
-                format!("Tulokset tallennettu tiedostoon {}", path.display())
-            } else {
-                format!("Results saved to {}", path.display())
-            }),
-            Err(e) => self.error = Some(if self.lang == AppLanguage::Finnish {
-                format!("Tulosten tallennus epäonnistui: {e}")
-            } else {
-                format!("Failed to save results: {e}")
-            }),
+            Ok(()) => {
+                self.status_info = Some(if self.lang == AppLanguage::Finnish {
+                    format!("Tulokset tallennettu tiedostoon {}", path.display())
+                } else {
+                    format!("Results saved to {}", path.display())
+                });
+                self.error = None;
+            }
+            Err(e) => {
+                self.error = Some(if self.lang == AppLanguage::Finnish {
+                    format!("Tulosten tallennus epäonnistui: {e}")
+                } else {
+                    format!("Failed to save results: {e}")
+                });
+                self.status_info = None;
+            }
         }
     }
 }
@@ -950,10 +986,16 @@ impl eframe::App for DoXsearchApp {
                             let dir_label = if self.lang == AppLanguage::Finnish { "Hakemisto" } else { "Directory" };
                             ui.label(RichText::new(dir_label).color(TEXT_MED).strong());
                             ui.add_space(3.0);
-                            ui.add(egui::TextEdit::singleline(&mut self.directory_input)
+                            let dir_resp = ui.add(egui::TextEdit::singleline(&mut self.directory_input)
                                 .desired_width(240.0)
                                 .hint_text("/home/user/docs")
                                 .font(FontId::monospace(11.0)));
+                            if dir_resp.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                && self.state != SearchState::Searching
+                            {
+                                self.start_search();
+                            }
                             ui.add_space(3.0);
                             ui.horizontal(|ui| {
                                 let browse_label = if self.lang == AppLanguage::Finnish { "Selaa..." } else { "Browse..." };
@@ -963,6 +1005,7 @@ impl eframe::App for DoXsearchApp {
                                     if let Some(path) = pick_folder_dialog(start) {
                                         self.directory_input = path.to_string_lossy().to_string();
                                         self.error = None;
+                                        self.status_info = None;
                                     }
                                 }
 
@@ -979,18 +1022,21 @@ impl eframe::App for DoXsearchApp {
                                 if ui.small_button(home_label).clicked() {
                                     self.directory_input = get_user_home_dir().to_string_lossy().to_string();
                                     self.error = None;
+                                    self.status_info = None;
                                 }
                                 if ui.small_button(&docs_label).clicked() {
                                     self.directory_input = docs_dir.to_string_lossy().to_string();
                                     self.error = None;
+                                    self.status_info = None;
                                 }
                                 if ui.small_button(&dl_label).clicked() {
                                     self.directory_input = dl_dir.to_string_lossy().to_string();
                                     self.error = None;
+                                    self.status_info = None;
                                 }
                             });
 
-                            if self.recent_directories.len() > 1 {
+                            if !self.recent_directories.is_empty() {
                                 ui.add_space(2.0);
                                 let recent_label = if self.lang == AppLanguage::Finnish { "Viimeisimmät kansiot..." } else { "Recent folders..." };
                                 egui::ComboBox::from_id_source("recent_dirs_combo")
@@ -998,9 +1044,9 @@ impl eframe::App for DoXsearchApp {
                                     .show_ui(ui, |ui| {
                                         for dir in &self.recent_directories {
                                             let label = truncate_path(dir, 32);
-                                            if ui.selectable_label(self.directory_input == *dir, label).clicked() {
-                                                self.directory_input = dir.clone();
+                                            if ui.selectable_value(&mut self.directory_input, dir.clone(), label).clicked() {
                                                 self.error = None;
+                                                self.status_info = None;
                                             }
                                         }
                                     });
@@ -1061,7 +1107,17 @@ impl eframe::App for DoXsearchApp {
                             ui.add_space(6.0);
 
                             let file_types_label = if self.lang == AppLanguage::Finnish { "Tiedostotyypit:" } else { "File types:" };
-                            ui.label(RichText::new(file_types_label).color(TEXT_MED));
+                            let all_btn_label = if self.lang == AppLanguage::Finnish { "Kaikki" } else { "All" };
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(file_types_label).color(TEXT_MED));
+                                let all_selected = self.opts.search_docx && self.opts.search_odt && self.opts.search_pdf && self.opts.search_txt;
+                                if !all_selected && ui.small_button(RichText::new(all_btn_label).font(FontId::proportional(11.0)).color(BLUE_MED)).clicked() {
+                                    self.opts.search_docx = true;
+                                    self.opts.search_odt = true;
+                                    self.opts.search_pdf = true;
+                                    self.opts.search_txt = true;
+                                }
+                            });
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
                                 ftbtn(ui, &mut self.opts.search_docx, "DOCX", BLUE_MED);
@@ -1155,7 +1211,12 @@ impl eframe::App for DoXsearchApp {
                                 ui.add(egui::ProgressBar::new(fraction).text(text).animate(true));
                             }
 
-                            if let Some(err) = &self.error.clone() {
+                            if let Some(info) = &self.status_info {
+                                ui.add_space(6.0);
+                                ui.colored_label(Color32::from_rgb(22, 101, 52), info);
+                            }
+
+                            if let Some(err) = &self.error {
                                 ui.add_space(6.0);
                                 ui.colored_label(Color32::RED, err);
                             }
@@ -1267,8 +1328,9 @@ impl eframe::App for DoXsearchApp {
 
                     egui::ScrollArea::vertical()
                         .id_source("file_list")
-                        .show(ui, |ui| {
-                            for (ri, result) in self.results.iter().enumerate() {
+                        .show_rows(ui, 88.0, self.results.len(), |ui, row_range| {
+                            for ri in row_range {
+                                let result = &self.results[ri];
                                 let is_sel = new_sel == Some(ri);
                                 let fname = result.file.file_name()
                                     .unwrap_or_default().to_string_lossy().to_string();
@@ -1279,8 +1341,7 @@ impl eframe::App for DoXsearchApp {
                                     "DOCX" => BLUE_MED,
                                     "ODT"  => GREEN,
                                     "PDF"  => ORANGE,
-                                    "TXT" | "MD" | "CSV" | "LOG" | "JSON" => PURPLE,
-                                    _      => TEXT_MED,
+                                    _      => PURPLE,
                                 };
 
                                 let date_str = result.modified
@@ -1321,9 +1382,17 @@ impl eframe::App for DoXsearchApp {
                                             .font(FontId::monospace(10.0)).color(TEXT_MED));
                                     }
                                     let matches_count_label = if self.lang == AppLanguage::Finnish {
-                                        format!("{} osumaa", result.matches.len())
+                                        if result.matches.len() >= search::MAX_MATCHES_PER_FILE {
+                                            format!("{}+ osumaa", search::MAX_MATCHES_PER_FILE)
+                                        } else {
+                                            format!("{} osumaa", result.matches.len())
+                                        }
                                     } else {
-                                        format!("{} matches", result.matches.len())
+                                        if result.matches.len() >= search::MAX_MATCHES_PER_FILE {
+                                            format!("{}+ matches", search::MAX_MATCHES_PER_FILE)
+                                        } else {
+                                            format!("{} matches", result.matches.len())
+                                        }
                                     };
                                     ui.label(RichText::new(matches_count_label)
                                         .font(FontId::proportional(10.0)).color(TEXT_MED));
@@ -1331,19 +1400,26 @@ impl eframe::App for DoXsearchApp {
                                 ui.horizontal(|ui| {
                                     ui.add_space(4.0);
                                     let open_btn_label = if self.lang == AppLanguage::Finnish { "Avaa" } else { "Open" };
+                                    let folder_btn_label = if self.lang == AppLanguage::Finnish { "Kansio" } else { "Folder" };
+                                    let copy_path_label = if self.lang == AppLanguage::Finnish { "Kopioi polku" } else { "Copy Path" };
                                     if ui.small_button(
                                         RichText::new(open_btn_label).color(BLUE_MED)
                                     ).clicked() {
                                         open_path = Some(result.file.clone());
                                     }
+                                    let fm_tooltip = if self.lang == AppLanguage::Finnish {
+                                        format!("Näytä: {}", os_file_manager_name(self.lang))
+                                    } else {
+                                        format!("Show in {}", os_file_manager_name(self.lang))
+                                    };
                                     if ui.small_button(
-                                        RichText::new(os_file_manager_name(self.lang)).color(TEXT_MED)
-                                    ).clicked() {
+                                        RichText::new(folder_btn_label).color(TEXT_MED)
+                                    ).on_hover_text(fm_tooltip).clicked() {
                                         if let Err(e) = show_in_file_manager(&result.file) {
                                             self.error = Some(e);
+                                            self.status_info = None;
                                         }
                                     }
-                                    let copy_path_label = if self.lang == AppLanguage::Finnish { "Kopioi polku" } else { "Copy Path" };
                                     if ui.small_button(
                                         RichText::new(copy_path_label).color(TEXT_MED)
                                     ).clicked() {
@@ -1361,6 +1437,7 @@ impl eframe::App for DoXsearchApp {
             if let Some(path) = open_path {
                 if let Err(e) = open::that(&path) {
                     self.error = Some(format!("Failed to open: {}", e));
+                    self.status_info = None;
                 }
             }
         }
@@ -1369,13 +1446,19 @@ impl eframe::App for DoXsearchApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.results.is_empty() {
                 ui.centered_and_justified(|ui| {
-                    let prompt_text = if self.state == SearchState::Searching {
-                        if self.lang == AppLanguage::Finnish { "Haetaan..." } else { "Searching..." }
+                    let prompt_text: String = if self.state == SearchState::Searching {
+                        if self.lang == AppLanguage::Finnish { "Haetaan...".to_string() } else { "Searching...".to_string() }
+                    } else if self.state == SearchState::Done {
+                        if self.lang == AppLanguage::Finnish {
+                            format!("Ei osumia hakusanalle \"{}\"", self.opts.query)
+                        } else {
+                            format!("No matches found for \"{}\"", self.opts.query)
+                        }
                     } else {
-                        if self.lang == AppLanguage::Finnish { "Kirjoita hakusana ja paina Hae" } else { "Enter a search term and press Search" }
+                        if self.lang == AppLanguage::Finnish { "Kirjoita hakusana ja paina Hae".to_string() } else { "Enter a search term and press Search".to_string() }
                     };
                     ui.label(RichText::new(prompt_text)
-                        .font(FontId::proportional(18.0)).color(GRAY_BORDER));
+                        .font(FontId::proportional(18.0)).color(if self.state == SearchState::Done { TEXT_MED } else { GRAY_BORDER }));
                 });
                 return;
             }
@@ -1414,6 +1497,7 @@ impl eframe::App for DoXsearchApp {
                 ).clicked() {
                     if let Err(e) = open::that(&result.file) {
                         self.error = Some(format!("Failed to open file: {}", e));
+                        self.status_info = None;
                     }
                 }
                 let show_fm_text = if self.lang == AppLanguage::Finnish {
@@ -1426,6 +1510,7 @@ impl eframe::App for DoXsearchApp {
                 ).clicked() {
                     if let Err(e) = show_in_file_manager(&result.file) {
                         self.error = Some(e);
+                        self.status_info = None;
                     }
                 }
                 let copy_path_text = if self.lang == AppLanguage::Finnish { "Kopioi polku" } else { "Copy Path" };
@@ -1441,7 +1526,17 @@ impl eframe::App for DoXsearchApp {
             ui.separator();
             ui.add_space(8.0);
 
-            // Match list
+            if result.matches.len() >= search::MAX_MATCHES_PER_FILE {
+                let limit_notice = if self.lang == AppLanguage::Finnish {
+                    format!("⚠️ Näytetään ensimmäiset {} osumaa (rajattu suorituskyvyn varmistamiseksi)", search::MAX_MATCHES_PER_FILE)
+                } else {
+                    format!("⚠️ Showing first {} matches (limited for performance)", search::MAX_MATCHES_PER_FILE)
+                };
+                ui.label(RichText::new(limit_notice).font(FontId::proportional(11.0)).color(ORANGE));
+                ui.add_space(4.0);
+            }
+
+            // Match list (dynamic height scroll area for variable-length snippets)
             egui::ScrollArea::vertical()
                 .id_source("match_list")
                 .show(ui, |ui| {
@@ -1477,11 +1572,27 @@ impl eframe::App for DoXsearchApp {
 }
 
 fn ftbtn(ui: &mut egui::Ui, enabled: &mut bool, label: &str, color: Color32) {
-    let fill = if *enabled { color } else { GRAY_BORDER };
-    let tc   = if *enabled { Color32::WHITE } else { TEXT_MED };
-    if ui.add(egui::Button::new(
-        RichText::new(label).font(FontId::monospace(11.0)).color(tc).strong()
-    ).fill(fill).rounding(4.0).min_size(Vec2::new(48.0, 24.0))).clicked() {
+    let (fill, stroke, tc, icon) = if *enabled {
+        (color, egui::Stroke::new(1.5, color), Color32::WHITE, "✓ ")
+    } else {
+        (
+            Color32::from_rgb(241, 245, 249),
+            egui::Stroke::new(1.0, GRAY_BORDER),
+            TEXT_MED,
+            "  ",
+        )
+    };
+
+    let btn_text = format!("{}{}", icon, label);
+    if ui.add(
+        egui::Button::new(
+            RichText::new(btn_text).font(FontId::monospace(11.0)).color(tc).strong()
+        )
+        .fill(fill)
+        .stroke(stroke)
+        .rounding(4.0)
+        .min_size(Vec2::new(56.0, 24.0))
+    ).clicked() {
         *enabled = !*enabled;
     }
 }
@@ -1513,15 +1624,18 @@ fn render_highlighted(ui: &mut egui::Ui, context: &str, query: &str, ignore_case
 
     let mut last = 0;
     for (start, end) in spans {
-        if start > last && start <= context.len() {
-            job.append(&context[last..start], 0.0, normal.clone());
+        let safe_start = start.clamp(last, context.len());
+        let safe_end = end.clamp(safe_start, context.len());
+
+        if safe_start > last && context.is_char_boundary(last) && context.is_char_boundary(safe_start) {
+            job.append(&context[last..safe_start], 0.0, normal.clone());
         }
-        if end <= context.len() && end >= start {
-            job.append(&context[start..end], 0.0, hi.clone());
-            last = end;
+        if safe_end > safe_start && context.is_char_boundary(safe_start) && context.is_char_boundary(safe_end) {
+            job.append(&context[safe_start..safe_end], 0.0, hi.clone());
+            last = safe_end;
         }
     }
-    if last < context.len() {
+    if last < context.len() && context.is_char_boundary(last) {
         job.append(&context[last..], 0.0, normal);
     }
 
@@ -1680,5 +1794,77 @@ mod tests {
             "file:///home/user/tiedosto_%C3%A4%C3%A4kk%C3%B6set.pdf"
         );
     }
+
+    #[test]
+    fn test_recent_directories_mru_order() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = DoXsearchApp {
+            opts: SearchOptions::default(),
+            directory_input: "/dir1".to_string(),
+            state: SearchState::Idle,
+            results: Vec::new(),
+            errors: Vec::new(),
+            error: None,
+            status_info: None,
+            progress_count: (0, 0),
+            selected_result: None,
+            sort_order: SortOrder::DateDesc,
+            date_filter: DateFilter::All,
+            size_filter: SizeFilter::NoLimit,
+            recent_directories: vec!["/dir1".to_string(), "/dir2".to_string(), "/dir3".to_string()],
+            cache: DocumentCache::new(),
+            last_search_stats: None,
+            lang: AppLanguage::Finnish,
+            current_search_id: 0,
+            cancel_flag: None,
+            tx,
+            rx,
+        };
+
+        // Select /dir3 and simulate MRU insertion
+        app.directory_input = "/dir3".to_string();
+        let dir_str = app.directory_input.clone();
+        if let Some(pos) = app.recent_directories.iter().position(|d| d == &dir_str) {
+            app.recent_directories.remove(pos);
+        }
+        app.recent_directories.insert(0, dir_str);
+
+        assert_eq!(app.recent_directories[0], "/dir3");
+        assert_eq!(app.recent_directories[1], "/dir1");
+        assert_eq!(app.recent_directories[2], "/dir2");
+    }
+
+    #[test]
+    fn test_cancel_search_increments_id() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = DoXsearchApp {
+            opts: SearchOptions::default(),
+            directory_input: ".".to_string(),
+            state: SearchState::Searching,
+            results: Vec::new(),
+            errors: Vec::new(),
+            error: None,
+            status_info: None,
+            progress_count: (5, 10),
+            selected_result: None,
+            sort_order: SortOrder::DateDesc,
+            date_filter: DateFilter::All,
+            size_filter: SizeFilter::NoLimit,
+            recent_directories: vec![],
+            cache: DocumentCache::new(),
+            last_search_stats: None,
+            lang: AppLanguage::Finnish,
+            current_search_id: 1,
+            cancel_flag: Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            tx,
+            rx,
+        };
+
+        app.cancel_search();
+        assert_eq!(app.current_search_id, 2);
+        assert_eq!(app.state, SearchState::Idle);
+        assert!(app.status_info.is_some());
+    }
 }
+
 

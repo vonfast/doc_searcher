@@ -107,7 +107,9 @@ jobs:
           </plist>
           EOF
           
-          if [ -f "assets/doxgrep.png" ]; then
+          if [ -f "assets/doxsearch.png" ]; then
+            cp assets/doxsearch.png target/DoXsearch.app/Contents/Resources/doxsearch.png
+          elif [ -f "assets/doxgrep.png" ]; then
             cp assets/doxgrep.png target/DoXsearch.app/Contents/Resources/doxsearch.png
           fi
 

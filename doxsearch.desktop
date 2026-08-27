@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=DoXsearch
-Comment=Search text in DOCX, ODT and PDF files
+Comment=Search text in DOCX, ODT, PDF and text files
 Exec=doxsearch
 Icon=doxsearch
 Terminal=false

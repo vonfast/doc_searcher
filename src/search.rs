@@ -6,48 +6,9 @@ use quick_xml::reader::Reader;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 use walkdir::WalkDir;
 use zip::ZipArchive;
-
-struct Semaphore {
-    max: usize,
-    count: Mutex<usize>,
-    cvar: Condvar,
-}
-
-impl Semaphore {
-    fn new(max: usize) -> Self {
-        Self {
-            max,
-            count: Mutex::new(0),
-            cvar: Condvar::new(),
-        }
-    }
-
-    fn acquire(&self) -> SemaphoreGuard<'_> {
-        let mut count = self.count.lock().unwrap_or_else(|e| e.into_inner());
-        while *count >= self.max {
-            count = self.cvar.wait(count).unwrap_or_else(|e| e.into_inner());
-        }
-        *count += 1;
-        SemaphoreGuard { sem: self }
-    }
-}
-
-struct SemaphoreGuard<'a> {
-    sem: &'a Semaphore,
-}
-
-impl<'a> Drop for SemaphoreGuard<'a> {
-    fn drop(&mut self) {
-        let mut count = self.sem.count.lock().unwrap_or_else(|e| e.into_inner());
-        *count = count.saturating_sub(1);
-        self.sem.cvar.notify_one();
-    }
-}
-
-static PDF_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
 
 #[derive(Hash, PartialEq, Eq, Clone, Debug)]
 pub struct CacheKey {
@@ -55,6 +16,10 @@ pub struct CacheKey {
     pub size: u64,
     pub modified: Option<std::time::SystemTime>,
 }
+
+const MAX_CACHE_TOTAL_BYTES: usize = 64 * 1024 * 1024; // 64 MB
+const MAX_CACHED_ENTRY_BYTES: usize = 1024 * 1024;     // 1 MB per file
+const MAX_CACHE_ENTRIES: usize = 500;
 
 #[derive(Clone, Default)]
 pub struct DocumentCache {
@@ -72,16 +37,30 @@ impl DocumentCache {
     }
 
     pub fn insert(&self, key: CacheKey, text: Arc<str>) {
-        // Only cache documents up to 5 MB of text to prevent memory ballooning
-        if text.len() > 5 * 1024 * 1024 {
+        // Only cache documents up to 1 MB of text to prevent memory ballooning
+        if text.len() > MAX_CACHED_ENTRY_BYTES {
             return;
         }
         if let Ok(mut guard) = self.entries.write() {
-            if guard.len() >= 2000 {
-                // Remove roughly half of the entries instead of wiping out everything
-                let to_remove: Vec<CacheKey> = guard.keys().take(1000).cloned().collect();
-                for k in to_remove {
-                    guard.remove(&k);
+            let mut current_bytes: usize = guard
+                .iter()
+                .map(|(k, v)| std::mem::size_of::<CacheKey>() + k.path.as_os_str().len() + v.len())
+                .sum();
+
+            let entry_bytes = std::mem::size_of::<CacheKey>() + key.path.as_os_str().len() + text.len();
+
+            // If exceeding max entries or total bytes, prune down
+            if guard.len() >= MAX_CACHE_ENTRIES || current_bytes + entry_bytes > MAX_CACHE_TOTAL_BYTES {
+                let target_bytes = MAX_CACHE_TOTAL_BYTES / 2;
+                let keys_to_remove: Vec<CacheKey> = guard.keys().cloned().collect();
+                for k in keys_to_remove {
+                    if let Some(v) = guard.remove(&k) {
+                        let rem_size = std::mem::size_of::<CacheKey>() + k.path.as_os_str().len() + v.len();
+                        current_bytes = current_bytes.saturating_sub(rem_size);
+                    }
+                    if current_bytes <= target_bytes && guard.len() < (MAX_CACHE_ENTRIES / 2) {
+                        break;
+                    }
                 }
             }
             guard.insert(key, text);
@@ -210,8 +189,8 @@ pub fn search_directory(
             if e.depth() == 0 {
                 return true;
             }
-            let is_dir = e.file_type().is_dir();
-            let is_file = e.file_type().is_file();
+            let is_dir = e.file_type().is_dir() || (e.file_type().is_symlink() && e.path().is_dir());
+            let is_file = e.file_type().is_file() || (e.file_type().is_symlink() && e.path().is_file());
             let name = e.file_name().to_string_lossy();
 
             if !opts.search_hidden && name.starts_with('.') {
@@ -245,10 +224,10 @@ pub fn search_directory(
                     .to_lowercase();
 
                 let matches_type = match ext.as_str() {
-                    "docx" => opts.search_docx,
-                    "odt" => opts.search_odt,
+                    "docx" | "docm" | "dotx" | "dotm" => opts.search_docx,
+                    "odt" | "ott" | "ods" | "odp" | "fodt" | "fods" => opts.search_odt,
                     "pdf" => opts.search_pdf,
-                    "txt" | "md" | "csv" | "log" | "json" => opts.search_txt,
+                    "txt" | "text" | "md" | "markdown" | "csv" | "tsv" | "log" | "json" | "xml" | "html" | "htm" | "yaml" | "yml" | "ini" | "conf" | "cfg" | "toml" | "rst" => opts.search_txt,
                     _ => false,
                 };
 
@@ -260,7 +239,7 @@ pub fn search_directory(
         })
         .filter_map(|e| e.ok())
         .filter_map(|e| {
-            if !e.file_type().is_file() {
+            if !e.file_type().is_file() && !e.path().is_file() {
                 return None;
             }
             let path = e.path();
@@ -271,7 +250,7 @@ pub fn search_directory(
                 .unwrap_or("")
                 .to_lowercase();
 
-            let meta = e.metadata().ok();
+            let meta = e.metadata().or_else(|_| std::fs::metadata(path)).ok();
             let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
             let modified = meta.and_then(|m| m.modified().ok());
 
@@ -283,10 +262,9 @@ pub fn search_directory(
             }
 
             if let Some(after) = opts.modified_after {
-                if let Some(mtime) = modified {
-                    if mtime < after {
-                        return None;
-                    }
+                match modified {
+                    Some(mtime) if mtime >= after => {}
+                    _ => return None,
                 }
             }
 
@@ -334,10 +312,11 @@ pub fn search_directory(
                     Ok(cached)
                 } else {
                     let raw_res = match candidate.ext.as_str() {
-                        "docx" => extract_docx(&candidate.path),
-                        "odt" => extract_odt(&candidate.path),
+                        "fodt" | "fods" => extract_flat_xml(&candidate.path),
+                        "docx" | "docm" | "dotx" | "dotm" => extract_docx(&candidate.path),
+                        "odt" | "ott" | "ods" | "odp" => extract_odt(&candidate.path),
                         "pdf" => extract_pdf(&candidate.path),
-                        "txt" | "md" | "csv" | "log" | "json" => extract_plain_text(&candidate.path),
+                        "txt" | "text" | "md" | "markdown" | "csv" | "tsv" | "log" | "json" | "xml" | "html" | "htm" | "yaml" | "yml" | "ini" | "conf" | "cfg" | "toml" | "rst" => extract_plain_text(&candidate.path),
                         _ => return,
                     };
                     match raw_res {
@@ -351,10 +330,11 @@ pub fn search_directory(
                 }
             } else {
                 match candidate.ext.as_str() {
-                    "docx" => extract_docx(&candidate.path).map(|t| t.into()),
-                    "odt" => extract_odt(&candidate.path).map(|t| t.into()),
+                    "fodt" | "fods" => extract_flat_xml(&candidate.path).map(|t| t.into()),
+                    "docx" | "docm" | "dotx" | "dotm" => extract_docx(&candidate.path).map(|t| t.into()),
+                    "odt" | "ott" | "ods" | "odp" => extract_odt(&candidate.path).map(|t| t.into()),
                     "pdf" => extract_pdf(&candidate.path).map(|t| t.into()),
-                    "txt" | "md" | "csv" | "log" | "json" => extract_plain_text(&candidate.path).map(|t| t.into()),
+                    "txt" | "text" | "md" | "markdown" | "csv" | "tsv" | "log" | "json" | "xml" | "html" | "htm" | "yaml" | "yml" | "ini" | "conf" | "cfg" | "toml" | "rst" => extract_plain_text(&candidate.path).map(|t| t.into()),
                     _ => return,
                 }
             };
@@ -368,9 +348,10 @@ pub fn search_directory(
                 Ok(text) => {
                     let matches = find_matches(&text, &opts.query, opts.ignore_case, opts.context_size);
                     if !matches.is_empty() {
+                        let display_type = candidate.ext.to_uppercase();
                         on_match(SearchResult {
                             file: candidate.path,
-                            file_type: candidate.ext.to_uppercase(),
+                            file_type: display_type,
                             matches,
                             modified: candidate.modified,
                         });
@@ -392,23 +373,68 @@ pub fn search_directory(
     })
 }
 
+const MAX_PLAIN_TEXT_FILE_SIZE: u64 = 25 * 1024 * 1024; // 25 MB max
+
 /// Extract text from plain text files (.txt, .md, .csv, .log, .json)
 pub fn extract_plain_text(path: &Path) -> Result<String> {
-    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > 100 * 1024 * 1024 {
-        return Err(anyhow::anyhow!("Tekstitiedosto on liian suuri (>100 MB): {}", path.display()));
+    let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if file_len > MAX_PLAIN_TEXT_FILE_SIZE {
+        return Err(anyhow::anyhow!(
+            "Tekstitiedosto on liian suuri (>25 MB): {}",
+            path.display()
+        ));
     }
     let bytes = std::fs::read(path)
         .with_context(|| format!("Could not read file: {}", path.display()))?;
 
-    // 1. Try UTF-8 first
-    if let Ok(s) = std::str::from_utf8(&bytes) {
-        return Ok(s.to_string());
+    if bytes.is_empty() {
+        return Ok(String::new());
     }
 
-    // 2. If not UTF-8, decode as ISO-8859-1 (Latin-1) where bytes 0x00..=0xFF map 1:1 to Unicode U+0000..=U+00FF.
-    // This preserves Nordic characters (ä, ö, å, Ä, Ö, Å) in legacy text/csv files.
-    let latin1: String = bytes.iter().map(|&b| b as char).collect();
-    Ok(latin1)
+    // Binary check: inspect first 4096 bytes
+    let sample = &bytes[..bytes.len().min(4096)];
+    let null_count = sample.iter().filter(|&&b| b == 0).count();
+    if null_count > 0 {
+        return Err(anyhow::anyhow!(
+            "Tiedosto sisältää binääridataa (nollatavuja): {}",
+            path.display()
+        ));
+    }
+
+    // Check control character density
+    let control_count = sample
+        .iter()
+        .filter(|&&b| b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r')
+        .count();
+    if sample.len() > 32 && control_count * 10 > sample.len() {
+        return Err(anyhow::anyhow!(
+            "Tiedosto näyttää olevan binääritiedosto: {}",
+            path.display()
+        ));
+    }
+
+    // 1. Try UTF-8 first
+    let raw_text = if let Ok(s) = std::str::from_utf8(&bytes) {
+        s.to_string()
+    } else {
+        // 2. If not UTF-8, decode as ISO-8859-1 (Latin-1) where bytes 0x00..=0xFF map 1:1 to Unicode U+0000..=U+00FF.
+        // This preserves Nordic characters (ä, ö, å, Ä, Ö, Å) in legacy text/csv files.
+        bytes.iter().map(|&b| b as char).collect()
+    };
+
+    // Sanitize control characters (except tab and newline) so egui font rendering won't corrupt
+    let sanitized: String = raw_text
+        .chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' && c != '\r' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+
+    Ok(sanitized)
 }
 
 /// Extract text from a .docx file using streaming XML reader across all body, header, footer, footnote, endnote, and comment parts
@@ -422,7 +448,7 @@ pub fn extract_docx(path: &Path) -> Result<String> {
     let mut xml_names: Vec<String> = archive
         .file_names()
         .filter(|name| {
-            let n = name.to_lowercase();
+            let n = name.replace('\\', "/").to_lowercase();
             n.starts_with("word/") && n.ends_with(".xml") && (
                 n == "word/document.xml"
                 || n.starts_with("word/header")
@@ -441,12 +467,13 @@ pub fn extract_docx(path: &Path) -> Result<String> {
 
     // Ensure word/document.xml comes first
     xml_names.sort_by(|a, b| {
-        if a.ends_with("document.xml") {
-            std::cmp::Ordering::Less
-        } else if b.ends_with("document.xml") {
-            std::cmp::Ordering::Greater
-        } else {
-            a.cmp(b)
+        let a_main = a.ends_with("document.xml");
+        let b_main = b.ends_with("document.xml");
+        match (a_main, b_main) {
+            (true, true) => a.cmp(b),
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (false, false) => a.cmp(b),
         }
     });
 
@@ -467,6 +494,15 @@ pub fn extract_docx(path: &Path) -> Result<String> {
     }
 
     Ok(full_text)
+}
+
+/// Extract text from a flat OpenDocument XML file (.fodt, .fods)
+pub fn extract_flat_xml(path: &Path) -> Result<String> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("Could not open file: {}", path.display()))?;
+    let reader = Reader::from_reader(std::io::BufReader::new(file));
+    extract_text_from_xml_reader(reader, false)
+        .with_context(|| format!("Error reading XML in: {}", path.display()))
 }
 
 /// Extract text from a .odt file using streaming XML reader across content.xml and styles.xml
@@ -612,15 +648,11 @@ pub fn extract_text_from_xml(xml: &str) -> Result<String> {
     extract_text_from_xml_reader(reader, is_docx)
 }
 
-/// Extract text from a .pdf file with header sanitization, concurrency throttling, panic safety, and fallback stream parsing
+/// Extract text from a .pdf file with header sanitization, panic safety, and fallback stream parsing
 pub fn extract_pdf(path: &Path) -> Result<String> {
     if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > 100 * 1024 * 1024 {
         return Err(anyhow::anyhow!("PDF-tiedosto on liian suuri (>100 MB): {}", path.display()));
     }
-
-    // Limit concurrent PDF parsing to at most 2 threads to prevent massive RAM spikes (OOM)
-    let sem = PDF_SEMAPHORE.get_or_init(|| Semaphore::new(2));
-    let _guard = sem.acquire();
 
     let bytes = std::fs::read(path)
         .with_context(|| format!("Could not read file: {}", path.display()))?;
@@ -700,8 +732,17 @@ fn extract_pdf_fallback(bytes: &[u8]) -> Option<String> {
                     }
                 };
 
-                let stream_content = decompressed.unwrap_or(stream_bytes);
-                extract_text_from_pdf_stream(stream_content, &mut extracted_text);
+                let mut stream_extracted = String::new();
+                if let Some(dec) = decompressed {
+                    extract_text_from_pdf_stream(dec, &mut stream_extracted);
+                }
+                if stream_extracted.trim().is_empty() {
+                    extract_text_from_pdf_stream(stream_bytes, &mut stream_extracted);
+                }
+                if !stream_extracted.trim().is_empty() {
+                    extracted_text.push_str(&stream_extracted);
+                    extracted_text.push(' ');
+                }
 
                 i = stream_start + end_pos + 9;
             } else {
@@ -822,54 +863,146 @@ pub fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
-pub fn starts_with_ignore_case(text_slice: &str, query_lower: &str) -> Option<usize> {
-    let mut text_chars = text_slice.chars();
-    let mut query_chars = query_lower.chars();
+pub fn starts_with_ignore_case(text_slice: &str, query: &str) -> Option<usize> {
+    let mut text_chars = text_slice.chars().peekable();
+    let mut query_chars = query.chars().peekable();
     let mut bytes_read = 0;
 
-    while let Some(q_char) = query_chars.next() {
-        if let Some(t_char) = text_chars.next() {
-            bytes_read += t_char.len_utf8();
-            let mut lowered = t_char.to_lowercase();
-            let first_lowered = lowered.next()?;
-            if first_lowered != q_char {
-                return None;
-            }
-            for extra_lowered in lowered {
-                if query_chars.next() != Some(extra_lowered) {
-                    return None;
+    while let Some(&q_char) = query_chars.peek() {
+        if q_char.is_whitespace() {
+            while let Some(&qc) = query_chars.peek() {
+                if qc.is_whitespace() {
+                    query_chars.next();
+                } else {
+                    break;
                 }
             }
+
+            let mut matched_space = false;
+            while let Some(&tc) = text_chars.peek() {
+                if tc.is_whitespace() {
+                    matched_space = true;
+                    bytes_read += tc.len_utf8();
+                    text_chars.next();
+                } else {
+                    break;
+                }
+            }
+            if !matched_space {
+                return None;
+            }
         } else {
-            return None;
+            query_chars.next();
+            if let Some(t_char) = text_chars.next() {
+                bytes_read += t_char.len_utf8();
+                let mut lowered_t = t_char.to_lowercase();
+                let mut lowered_q = q_char.to_lowercase();
+                let first_t = lowered_t.next();
+                let first_q = lowered_q.next();
+                if first_t != first_q {
+                    return None;
+                }
+                for (ct, cq) in lowered_t.by_ref().zip(lowered_q.by_ref()) {
+                    if ct != cq {
+                        return None;
+                    }
+                }
+                if lowered_t.next().is_some() || lowered_q.next().is_some() {
+                    return None;
+                }
+            } else {
+                return None;
+            }
         }
     }
     Some(bytes_read)
 }
+
+pub fn starts_with_exact(text_slice: &str, query: &str) -> Option<usize> {
+    let mut text_chars = text_slice.chars().peekable();
+    let mut query_chars = query.chars().peekable();
+    let mut bytes_read = 0;
+
+    while let Some(&q_char) = query_chars.peek() {
+        if q_char.is_whitespace() {
+            while let Some(&qc) = query_chars.peek() {
+                if qc.is_whitespace() {
+                    query_chars.next();
+                } else {
+                    break;
+                }
+            }
+
+            let mut matched_space = false;
+            while let Some(&tc) = text_chars.peek() {
+                if tc.is_whitespace() {
+                    matched_space = true;
+                    bytes_read += tc.len_utf8();
+                    text_chars.next();
+                } else {
+                    break;
+                }
+            }
+            if !matched_space {
+                return None;
+            }
+        } else {
+            query_chars.next();
+            if let Some(t_char) = text_chars.next() {
+                bytes_read += t_char.len_utf8();
+                if t_char != q_char {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+    }
+    Some(bytes_read)
+}
+
+pub const MAX_MATCHES_PER_FILE: usize = 200;
 
 pub fn find_match_spans(
     text: &str,
     query: &str,
     ignore_case: bool,
 ) -> Vec<(usize, usize)> {
+    find_match_spans_limit(text, query, ignore_case, None)
+}
+
+pub fn find_match_spans_limit(
+    text: &str,
+    query: &str,
+    ignore_case: bool,
+    limit: Option<usize>,
+) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
-    if query.is_empty() {
+    let trimmed_query = query.trim();
+    if trimmed_query.is_empty() {
         return spans;
     }
 
-    let q_lower = query.to_lowercase();
     let mut char_indices = text.char_indices().peekable();
 
     while let Some(&(start_idx, _)) = char_indices.peek() {
+        if let Some(max) = limit {
+            if spans.len() >= max {
+                break;
+            }
+        }
+
         let match_bytes = if ignore_case {
-            starts_with_ignore_case(&text[start_idx..], &q_lower)
-        } else if text[start_idx..].starts_with(query) {
-            Some(query.len())
+            starts_with_ignore_case(&text[start_idx..], trimmed_query)
         } else {
-            None
+            starts_with_exact(&text[start_idx..], trimmed_query)
         };
 
         if let Some(bytes) = match_bytes {
+            if bytes == 0 {
+                char_indices.next();
+                continue;
+            }
             let end_idx = start_idx + bytes;
             spans.push((start_idx, end_idx));
 
@@ -895,7 +1028,17 @@ pub fn find_matches(
     ignore_case: bool,
     context_size: usize,
 ) -> Vec<Match> {
-    let spans = find_match_spans(text, query, ignore_case);
+    find_matches_limit(text, query, ignore_case, context_size, Some(MAX_MATCHES_PER_FILE))
+}
+
+pub fn find_matches_limit(
+    text: &str,
+    query: &str,
+    ignore_case: bool,
+    context_size: usize,
+    limit: Option<usize>,
+) -> Vec<Match> {
+    let spans = find_match_spans_limit(text, query, ignore_case, limit);
     let mut matches = Vec::with_capacity(spans.len());
 
     for (start_idx, end_idx) in spans {
@@ -910,11 +1053,17 @@ pub fn find_matches(
         if actual_start > 0 {
             context.push_str("… ");
         }
-        for (i, word) in sub_slice.split_whitespace().enumerate() {
-            if i > 0 {
-                context.push(' ');
+        let mut prev_space = false;
+        for c in sub_slice.chars() {
+            if c.is_whitespace() {
+                if !prev_space {
+                    context.push(' ');
+                    prev_space = true;
+                }
+            } else {
+                context.push(c);
+                prev_space = false;
             }
-            context.push_str(word);
         }
         if actual_end < text.len() {
             context.push_str(" …");
@@ -1213,7 +1362,7 @@ mod tests {
     #[test]
     fn test_cache_partial_eviction_over_capacity() {
         let cache = DocumentCache::new();
-        for i in 0..2050 {
+        for i in 0..600 {
             let key = CacheKey {
                 path: PathBuf::from(format!("/tmp/doc_{}.docx", i)),
                 size: 100,
@@ -1221,9 +1370,50 @@ mod tests {
             };
             cache.insert(key, format!("Content {}", i).into());
         }
-        // Should have pruned some elements, but NOT cleared everything to 0
-        assert!(cache.len() > 1000);
-        assert!(cache.len() <= 2000);
+        // Should have pruned elements to under MAX_CACHE_ENTRIES
+        assert!(cache.len() >= 200);
+        assert!(cache.len() <= MAX_CACHE_ENTRIES);
+    }
+
+    #[test]
+    fn test_find_matches_max_limit_capping() {
+        // Create a string with 1000 occurrences of "test"
+        let text = "test ".repeat(1000);
+        let matches = find_matches(&text, "test", false, 10);
+        // Must be capped at MAX_MATCHES_PER_FILE (200)
+        assert_eq!(matches.len(), MAX_MATCHES_PER_FILE);
+    }
+
+    #[test]
+    fn test_binary_file_detection_in_plain_text() {
+        let temp_dir = std::env::temp_dir();
+        let bin_file = temp_dir.join("doxsearch_fake_text_with_nulls.txt");
+        let mut binary_data = b"Hello world! This looks like text initially...".to_vec();
+        binary_data.push(0x00); // null byte
+        binary_data.extend_from_slice(b"Some binary trailer data");
+        std::fs::write(&bin_file, &binary_data).expect("write failed");
+
+        let result = extract_plain_text(&bin_file);
+        assert!(result.is_err(), "Binary file containing null bytes must be rejected");
+
+        let _ = std::fs::remove_file(bin_file);
+    }
+
+    #[test]
+    fn test_cache_memory_budget_enforcement() {
+        let cache = DocumentCache::new();
+        // Insert items up to limit
+        for i in 0..100 {
+            let key = CacheKey {
+                path: PathBuf::from(format!("/tmp/doc_budget_{}.txt", i)),
+                size: 500_000,
+                modified: None,
+            };
+            // 500 KB each * 100 = 50 MB
+            let data: Arc<str> = "A".repeat(500_000).into();
+            cache.insert(key, data);
+        }
+        assert!(cache.memory_usage_bytes() <= MAX_CACHE_TOTAL_BYTES);
     }
 
     #[test]
@@ -1238,5 +1428,292 @@ mod tests {
         let max_mb: u64 = u64::MAX;
         let max_bytes = max_mb.saturating_mul(1024 * 1024);
         assert_eq!(max_bytes, u64::MAX);
+    }
+
+    #[test]
+    fn test_multi_format_directory_search_finds_all_types() {
+        let temp_dir = std::env::temp_dir().join(format!("doxsearch_multi_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        // 1. Plain text file
+        let txt_path = temp_dir.join("sample.txt");
+        std::fs::write(&txt_path, "Tämä on hakutermi tekstissä").unwrap();
+
+        // 2. Markdown file
+        let md_path = temp_dir.join("notes.md");
+        std::fs::write(&md_path, "Muistiinpanot: hakutermi löytyy täältä").unwrap();
+
+        // 3. Mock PDF file with stream text
+        let pdf_path = temp_dir.join("doc.pdf");
+        let pdf_content = b"%PDF-1.4\n1 0 obj\n<< /Length 50 >>\nstream\nBT (hakutermi pdf-tiedostossa) Tj ET\nendstream\nendobj\n%%EOF";
+        std::fs::write(&pdf_path, pdf_content).unwrap();
+
+        let cache = DocumentCache::new();
+        let opts = SearchOptions {
+            directory: temp_dir.clone(),
+            query: "hakutermi".to_string(),
+            search_docx: true,
+            search_odt: true,
+            search_pdf: true,
+            search_txt: true,
+            ..Default::default()
+        };
+
+        let matches_found = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let m_clone = matches_found.clone();
+
+        let stats = search_directory(
+            &opts,
+            &cache,
+            None,
+            move |res| {
+                m_clone.lock().unwrap().push(res);
+            },
+            |_| {},
+            |_, _| {},
+        ).unwrap();
+
+        let results = matches_found.lock().unwrap();
+        assert_eq!(results.len(), 3, "All 3 supported format files must be found");
+        let types: Vec<String> = results.iter().map(|r| r.file_type.clone()).collect();
+        assert!(types.contains(&"TXT".to_string()) || types.contains(&"MD".to_string()));
+        assert!(types.contains(&"PDF".to_string()));
+        assert_eq!(stats.total_count, 3);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_repeated_search_with_changing_file_type_options() {
+        let temp_dir = std::env::temp_dir().join(format!("doxsearch_repeat_opts_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let txt_path = temp_dir.join("sample.txt");
+        std::fs::write(&txt_path, "UniikkiHakusana tekstissä").unwrap();
+
+        let pdf_path = temp_dir.join("doc.pdf");
+        let pdf_content = b"%PDF-1.4\n1 0 obj\n<< /Length 50 >>\nstream\nBT (UniikkiHakusana pdf-tiedostossa) Tj ET\nendstream\nendobj\n%%EOF";
+        std::fs::write(&pdf_path, pdf_content).unwrap();
+
+        let cache = DocumentCache::new();
+
+        // 1st search: only TXT
+        let opts1 = SearchOptions {
+            directory: temp_dir.clone(),
+            query: "UniikkiHakusana".to_string(),
+            search_docx: false,
+            search_odt: false,
+            search_pdf: false,
+            search_txt: true,
+            ..Default::default()
+        };
+        let matches1 = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let m1 = matches1.clone();
+        let _ = search_directory(&opts1, &cache, None, move |r| m1.lock().unwrap().push(r), |_| {}, |_, _| {}).unwrap();
+        assert_eq!(matches1.lock().unwrap().len(), 1);
+        assert_eq!(matches1.lock().unwrap()[0].file_type, "TXT");
+
+        // 2nd search: only PDF
+        let opts2 = SearchOptions {
+            directory: temp_dir.clone(),
+            query: "UniikkiHakusana".to_string(),
+            search_docx: false,
+            search_odt: false,
+            search_pdf: true,
+            search_txt: false,
+            ..Default::default()
+        };
+        let matches2 = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let m2 = matches2.clone();
+        let _ = search_directory(&opts2, &cache, None, move |r| m2.lock().unwrap().push(r), |_| {}, |_, _| {}).unwrap();
+        assert_eq!(matches2.lock().unwrap().len(), 1);
+        assert_eq!(matches2.lock().unwrap()[0].file_type, "PDF");
+
+        // 3rd search: both TXT and PDF
+        let opts3 = SearchOptions {
+            directory: temp_dir.clone(),
+            query: "UniikkiHakusana".to_string(),
+            search_docx: true,
+            search_odt: true,
+            search_pdf: true,
+            search_txt: true,
+            ..Default::default()
+        };
+        let matches3 = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let m3 = matches3.clone();
+        let _ = search_directory(&opts3, &cache, None, move |r| m3.lock().unwrap().push(r), |_| {}, |_, _| {}).unwrap();
+        assert_eq!(matches3.lock().unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_extract_flat_xml_fodt() {
+        let temp_dir = std::env::temp_dir().join(format!("doxsearch_fodt_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let fodt_path = temp_dir.join("sample.fodt");
+        let xml_content = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+                         xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+            <office:body>
+                <office:text>
+                    <text:p>Tämä on suora Flat ODF XML tiedosto.</text:p>
+                </office:text>
+            </office:body>
+        </office:document>"#;
+        std::fs::write(&fodt_path, xml_content).unwrap();
+
+        let extracted = extract_flat_xml(&fodt_path).expect("Flat XML extract failed");
+        assert!(extracted.contains("suora Flat ODF XML tiedosto"));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_multiword_whitespace_and_newline_matching() {
+        let text = "Tämä on tärkeä\nasiakirja jossa on   useita   välejä.";
+        // Search with standard space
+        let matches = find_matches(text, "tärkeä asiakirja", true, 30);
+        assert_eq!(matches.len(), 1, "Should match across newline");
+
+        // Search with multiple spaces in query
+        let matches2 = find_matches(text, "useita       välejä", true, 30);
+        assert_eq!(matches2.len(), 1, "Should match multiple spaces in query to multiple spaces in text");
+
+        // Exact case search
+        let matches3 = find_matches(text, "tärkeä asiakirja", false, 30);
+        assert_eq!(matches3.len(), 1);
+    }
+
+    #[test]
+    fn test_docx_sort_by_strict_weak_ordering() {
+        let mut names = vec![
+            "word/document.xml".to_string(),
+            "word/document.xml".to_string(),
+            "word/header1.xml".to_string(),
+            "word/footer1.xml".to_string(),
+        ];
+
+        names.sort_by(|a, b| {
+            let a_main = a.ends_with("document.xml");
+            let b_main = b.ends_with("document.xml");
+            match (a_main, b_main) {
+                (true, true) => a.cmp(b),
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                (false, false) => a.cmp(b),
+            }
+        });
+
+        assert_eq!(names[0], "word/document.xml");
+        assert_eq!(names[1], "word/document.xml");
+    }
+
+    #[test]
+    fn test_date_filter_excludes_none_and_respects_after() {
+        let temp_dir = std::env::temp_dir().join(format!("doxsearch_date_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let file1 = temp_dir.join("recent.txt");
+        std::fs::write(&file1, "Tämä on tuore tiedosto").unwrap();
+
+        let cache = DocumentCache::new();
+        let now = std::time::SystemTime::now();
+
+        // Filter requiring file modified in the future (no files should match)
+        let future_time = now + std::time::Duration::from_secs(3600);
+        let opts = SearchOptions {
+            directory: temp_dir.clone(),
+            query: "tuore".to_string(),
+            modified_after: Some(future_time),
+            ..Default::default()
+        };
+
+        let matches_found = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let m_clone = matches_found.clone();
+        let _ = search_directory(&opts, &cache, None, move |r| m_clone.lock().unwrap().push(r), |_| {}, |_, _| {}).unwrap();
+
+        assert_eq!(matches_found.lock().unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_directory_change_searches_all_supported_types() {
+        let base_dir = std::env::temp_dir().join(format!("doxsearch_dir_switch_{}", std::process::id()));
+        let dir_a = base_dir.join("folder_a");
+        let dir_b = base_dir.join("folder_b");
+        let _ = std::fs::create_dir_all(&dir_a);
+        let _ = std::fs::create_dir_all(&dir_b);
+
+        // Directory A files: PDF, TXT
+        let pdf_a = dir_a.join("report_a.pdf");
+        let pdf_content = b"%PDF-1.4\n1 0 obj\n<< /Length 50 >>\nstream\nBT (etsittava_termi pdf A) Tj ET\nendstream\nendobj\n%%EOF";
+        std::fs::write(&pdf_a, pdf_content).unwrap();
+
+        let txt_a = dir_a.join("notes_a.txt");
+        std::fs::write(&txt_a, "etsittava_termi teksti A").unwrap();
+
+        // Directory B files: PDF, MD (text), Flat ODF XML
+        let pdf_b = dir_b.join("doc_b.pdf");
+        let pdf_content_b = b"%PDF-1.4\n1 0 obj\n<< /Length 50 >>\nstream\nBT (etsittava_termi pdf B) Tj ET\nendstream\nendobj\n%%EOF";
+        std::fs::write(&pdf_b, pdf_content_b).unwrap();
+        eprintln!("Direct extract_pdf on pdf_b: {:?}", extract_pdf(&pdf_b));
+
+        let md_b = dir_b.join("readme_b.md");
+        std::fs::write(&md_b, "etsittava_termi markdown B").unwrap();
+
+        let fodt_b = dir_b.join("letter_b.fodt");
+        let fodt_content = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+                         xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+            <office:body><office:text><text:p>etsittava_termi fodt B</text:p></office:text></office:body>
+        </office:document>"#;
+        std::fs::write(&fodt_b, fodt_content).unwrap();
+
+        let cache = DocumentCache::new();
+
+        // 1. First search in Directory A
+        let mut opts = SearchOptions {
+            directory: dir_a.clone(),
+            query: "etsittava_termi".to_string(),
+            search_docx: true,
+            search_odt: true,
+            search_pdf: true,
+            search_txt: true,
+            ..Default::default()
+        };
+
+        let matches_a = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let m_a = matches_a.clone();
+        let stats_a = search_directory(&opts, &cache, None, move |r| m_a.lock().unwrap().push(r), |_| {}, |_, _| {}).unwrap();
+
+        let results_a = matches_a.lock().unwrap();
+        assert_eq!(results_a.len(), 2, "Dir A should find both PDF and TXT");
+        assert_eq!(stats_a.total_count, 2);
+
+        // 2. Change path to Directory B (simulating path switch in UI)
+        opts.directory = dir_b.clone();
+
+        let matches_b = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let m_b = matches_b.clone();
+        let stats_b = search_directory(
+            &opts,
+            &cache,
+            None,
+            move |r| m_b.lock().unwrap().push(r),
+            |_| {},
+            |_, _| {},
+        ).unwrap();
+
+        let results_b = matches_b.lock().unwrap();
+        assert_eq!(results_b.len(), 3, "Dir B should find PDF, MD, and FODT (not just txt)");
+        let types_b: Vec<String> = results_b.iter().map(|r| r.file_type.clone()).collect();
+        assert!(types_b.contains(&"PDF".to_string()));
+        assert!(types_b.contains(&"MD".to_string()));
+        assert!(types_b.contains(&"FODT".to_string()));
+        assert_eq!(stats_b.total_count, 3);
+
+        let _ = std::fs::remove_dir_all(base_dir);
     }
 }
