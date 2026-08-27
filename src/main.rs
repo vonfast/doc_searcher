@@ -12,6 +12,7 @@ const BLUE_DARK:  Color32 = Color32::from_rgb(30,  58,  138);
 const BLUE_MED:   Color32 = Color32::from_rgb(59,  130, 246);
 const GREEN:      Color32 = Color32::from_rgb(34,  197, 94);
 const ORANGE:     Color32 = Color32::from_rgb(249, 115, 22);
+const PURPLE:     Color32 = Color32::from_rgb(147, 51,  234);
 const RED_ACCENT: Color32 = Color32::from_rgb(239, 68,  68);
 const GRAY_BORDER:Color32 = Color32::from_rgb(203, 213, 225);
 const TEXT_DARK:  Color32 = Color32::from_rgb(15,  23,  42);
@@ -42,6 +43,66 @@ impl SortOrder {
             SortOrder::DateAsc => "Date (Oldest first)",
             SortOrder::Name => "Name (A-Z)",
             SortOrder::Matches => "Match Count",
+        }
+    }
+}
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum DateFilter {
+    All,
+    Last24Hours,
+    Last7Days,
+    Last30Days,
+    LastYear,
+}
+
+impl DateFilter {
+    fn label(&self) -> &'static str {
+        match self {
+            DateFilter::All => "All time",
+            DateFilter::Last24Hours => "Last 24 hours",
+            DateFilter::Last7Days => "Last 7 days",
+            DateFilter::Last30Days => "Last 30 days",
+            DateFilter::LastYear => "Last year",
+        }
+    }
+
+    fn to_system_time(&self) -> Option<std::time::SystemTime> {
+        let now = std::time::SystemTime::now();
+        match self {
+            DateFilter::All => None,
+            DateFilter::Last24Hours => now.checked_sub(std::time::Duration::from_secs(24 * 3600)),
+            DateFilter::Last7Days => now.checked_sub(std::time::Duration::from_secs(7 * 24 * 3600)),
+            DateFilter::Last30Days => now.checked_sub(std::time::Duration::from_secs(30 * 24 * 3600)),
+            DateFilter::LastYear => now.checked_sub(std::time::Duration::from_secs(365 * 24 * 3600)),
+        }
+    }
+}
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum SizeFilter {
+    NoLimit,
+    Max10MB,
+    Max50MB,
+    Max100MB,
+}
+
+impl SizeFilter {
+    fn label(&self) -> &'static str {
+        match self {
+            SizeFilter::NoLimit => "No size limit",
+            SizeFilter::Max10MB => "Max 10 MB",
+            SizeFilter::Max50MB => "Max 50 MB",
+            SizeFilter::Max100MB => "Max 100 MB",
+        }
+    }
+
+    fn to_mb(&self) -> Option<u64> {
+        match self {
+            SizeFilter::NoLimit => None,
+            SizeFilter::Max10MB => Some(10),
+            SizeFilter::Max50MB => Some(50),
+            SizeFilter::Max100MB => Some(100),
         }
     }
 }
@@ -91,6 +152,9 @@ struct DoXsearchApp {
     progress_count: (usize, usize),
     selected_result: Option<usize>,
     sort_order: SortOrder,
+    date_filter: DateFilter,
+    size_filter: SizeFilter,
+    recent_directories: Vec<String>,
     cache: DocumentCache,
     tx: Sender<SearchMessage>,
     rx: Receiver<SearchMessage>,
@@ -103,9 +167,15 @@ impl DoXsearchApp {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_else(|_| ".".to_string());
+        let docs = PathBuf::from(&home).join("Documents");
+        let initial_dir = if docs.exists() && docs.is_dir() {
+            docs.to_string_lossy().to_string()
+        } else {
+            home.clone()
+        };
         Self {
-            directory_input: home.clone(),
-            opts: SearchOptions { directory: PathBuf::from(&home), ..Default::default() },
+            directory_input: initial_dir.clone(),
+            opts: SearchOptions { directory: PathBuf::from(&initial_dir), ..Default::default() },
             state: SearchState::Idle,
             results: Vec::new(),
             errors: Vec::new(),
@@ -113,6 +183,9 @@ impl DoXsearchApp {
             progress_count: (0, 0),
             selected_result: None,
             sort_order: SortOrder::DateDesc,
+            date_filter: DateFilter::All,
+            size_filter: SizeFilter::NoLimit,
+            recent_directories: vec![home],
             cache: DocumentCache::new(),
             tx,
             rx,
@@ -151,8 +224,8 @@ impl DoXsearchApp {
             self.error = Some("Please enter a search term first.".to_string());
             return;
         }
-        if !self.opts.search_docx && !self.opts.search_odt && !self.opts.search_pdf {
-            self.error = Some("Please select at least one file type (DOCX, ODT, PDF).".to_string());
+        if !self.opts.search_docx && !self.opts.search_odt && !self.opts.search_pdf && !self.opts.search_txt {
+            self.error = Some("Please select at least one file type (DOCX, ODT, PDF, TXT).".to_string());
             return;
         }
 
@@ -161,6 +234,19 @@ impl DoXsearchApp {
             self.error = Some(format!("Directory not found: {}", self.directory_input));
             return;
         }
+
+        // Add to recent directories
+        let dir_str = self.directory_input.clone();
+        if !self.recent_directories.contains(&dir_str) {
+            self.recent_directories.insert(0, dir_str);
+            if self.recent_directories.len() > 6 {
+                self.recent_directories.pop();
+            }
+        }
+
+        self.opts.modified_after = self.date_filter.to_system_time();
+        self.opts.max_file_size_mb = self.size_filter.to_mb();
+
         self.state = SearchState::Searching;
         self.results.clear();
         self.errors.clear();
@@ -319,7 +405,7 @@ impl eframe::App for DoXsearchApp {
                         .font(FontId::proportional(22.0))
                         .color(BLUE_DARK).strong());
                     ui.add_space(12.0);
-                    ui.label(RichText::new("| Search text in DOCX, ODT and PDF files")
+                    ui.label(RichText::new("| Search text in DOCX, ODT, PDF and TXT files")
                         .font(FontId::proportional(13.0))
                         .color(TEXT_MED));
                 });
@@ -342,14 +428,45 @@ impl eframe::App for DoXsearchApp {
                                 .hint_text("/home/user/docs")
                                 .font(FontId::monospace(11.0)));
                             ui.add_space(3.0);
-                            if ui.button("Browse...").clicked() {
-                                if let Some(path) = rfd::FileDialog::new()
-                                    .pick_folder()
-                                {
-                                    self.directory_input = path.to_string_lossy().to_string();
+                            ui.horizontal(|ui| {
+                                if ui.button("Browse...").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .pick_folder()
+                                    {
+                                        self.directory_input = path.to_string_lossy().to_string();
+                                        self.error = None;
+                                    }
+                                }
+                                let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".to_string());
+                                if ui.small_button("~ Home").clicked() {
+                                    self.directory_input = home.clone();
                                     self.error = None;
                                 }
+                                if ui.small_button("Docs").clicked() {
+                                    self.directory_input = PathBuf::from(&home).join("Documents").to_string_lossy().to_string();
+                                    self.error = None;
+                                }
+                                if ui.small_button("Downloads").clicked() {
+                                    self.directory_input = PathBuf::from(&home).join("Downloads").to_string_lossy().to_string();
+                                    self.error = None;
+                                }
+                            });
+
+                            if self.recent_directories.len() > 1 {
+                                ui.add_space(2.0);
+                                egui::ComboBox::from_id_source("recent_dirs_combo")
+                                    .selected_text(RichText::new("Recent folders...").font(FontId::proportional(11.0)))
+                                    .show_ui(ui, |ui| {
+                                        for dir in &self.recent_directories {
+                                            let label = truncate_path(dir, 32);
+                                            if ui.selectable_label(self.directory_input == *dir, label).clicked() {
+                                                self.directory_input = dir.clone();
+                                                self.error = None;
+                                            }
+                                        }
+                                    });
                             }
+
                             ui.add_space(10.0);
                             ui.separator();
                             ui.add_space(10.0);
@@ -389,11 +506,38 @@ impl eframe::App for DoXsearchApp {
                                 }
                             });
                             ui.add_space(6.0);
+
+                            ui.label(RichText::new("File types:").color(TEXT_MED));
+                            ui.add_space(4.0);
                             ui.horizontal(|ui| {
                                 ftbtn(ui, &mut self.opts.search_docx, "DOCX", BLUE_MED);
                                 ftbtn(ui, &mut self.opts.search_odt,  "ODT",  GREEN);
                                 ftbtn(ui, &mut self.opts.search_pdf,  "PDF",  ORANGE);
+                                ftbtn(ui, &mut self.opts.search_txt,  "TXT",  PURPLE);
                             });
+                            ui.add_space(6.0);
+
+                            ui.label(RichText::new("Date range:").color(TEXT_MED));
+                            egui::ComboBox::from_id_source("date_filter_combo")
+                                .selected_text(RichText::new(self.date_filter.label()).font(FontId::proportional(12.0)))
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.date_filter, DateFilter::All, DateFilter::All.label());
+                                    ui.selectable_value(&mut self.date_filter, DateFilter::Last24Hours, DateFilter::Last24Hours.label());
+                                    ui.selectable_value(&mut self.date_filter, DateFilter::Last7Days, DateFilter::Last7Days.label());
+                                    ui.selectable_value(&mut self.date_filter, DateFilter::Last30Days, DateFilter::Last30Days.label());
+                                    ui.selectable_value(&mut self.date_filter, DateFilter::LastYear, DateFilter::LastYear.label());
+                                });
+                            ui.add_space(6.0);
+
+                            ui.label(RichText::new("Max file size:").color(TEXT_MED));
+                            egui::ComboBox::from_id_source("size_filter_combo")
+                                .selected_text(RichText::new(self.size_filter.label()).font(FontId::proportional(12.0)))
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.size_filter, SizeFilter::NoLimit, SizeFilter::NoLimit.label());
+                                    ui.selectable_value(&mut self.size_filter, SizeFilter::Max10MB, SizeFilter::Max10MB.label());
+                                    ui.selectable_value(&mut self.size_filter, SizeFilter::Max50MB, SizeFilter::Max50MB.label());
+                                    ui.selectable_value(&mut self.size_filter, SizeFilter::Max100MB, SizeFilter::Max100MB.label());
+                                });
                             ui.add_space(6.0);
 
                             ui.label(RichText::new("Context:").color(TEXT_MED));
@@ -523,6 +667,7 @@ impl eframe::App for DoXsearchApp {
                                     "DOCX" => BLUE_MED,
                                     "ODT"  => GREEN,
                                     "PDF"  => ORANGE,
+                                    "TXT" | "MD" | "CSV" | "LOG" | "JSON" => PURPLE,
                                     _      => TEXT_MED,
                                 };
 
@@ -570,9 +715,21 @@ impl eframe::App for DoXsearchApp {
                                 ui.horizontal(|ui| {
                                     ui.add_space(4.0);
                                     if ui.small_button(
-                                        RichText::new("Open File").color(BLUE_MED)
+                                        RichText::new("Open").color(BLUE_MED)
                                     ).clicked() {
                                         open_path = Some(result.file.clone());
+                                    }
+                                    if ui.small_button(
+                                        RichText::new("Folder").color(TEXT_MED)
+                                    ).clicked() {
+                                        if let Some(parent) = result.file.parent() {
+                                            open_path = Some(parent.to_path_buf());
+                                        }
+                                    }
+                                    if ui.small_button(
+                                        RichText::new("Copy Path").color(TEXT_MED)
+                                    ).clicked() {
+                                        ui.output_mut(|o| o.copied_text = result.file.to_string_lossy().to_string());
                                     }
                                 });
 
@@ -585,7 +742,7 @@ impl eframe::App for DoXsearchApp {
             self.selected_result = new_sel;
             if let Some(path) = open_path {
                 if let Err(e) = open::that(&path) {
-                    self.error = Some(format!("Failed to open file: {}", e));
+                    self.error = Some(format!("Failed to open: {}", e));
                 }
             }
         }
@@ -632,6 +789,20 @@ impl eframe::App for DoXsearchApp {
                         self.error = Some(format!("Failed to open file: {}", e));
                     }
                 }
+                if ui.button(
+                    RichText::new("Open Folder").color(TEXT_DARK)
+                ).clicked() {
+                    if let Some(parent) = result.file.parent() {
+                        if let Err(e) = open::that(parent) {
+                            self.error = Some(format!("Failed to open folder: {}", e));
+                        }
+                    }
+                }
+                if ui.button(
+                    RichText::new("Copy Path").color(TEXT_DARK)
+                ).clicked() {
+                    ui.output_mut(|o| o.copied_text = result.file.to_string_lossy().to_string());
+                }
             });
             ui.label(RichText::new(result.file.to_string_lossy().as_ref())
                 .font(FontId::monospace(11.0)).color(TEXT_MED));
@@ -644,10 +815,17 @@ impl eframe::App for DoXsearchApp {
                 .id_source("match_list")
                 .show(ui, |ui| {
                     for (mi, m) in result.matches.iter().enumerate() {
-                        // Match number on its own line
-                        ui.label(RichText::new(format!("Match #{}", mi + 1))
-                            .font(FontId::monospace(11.0))
-                            .color(TEXT_MED));
+                        // Match header with copy button
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("Match #{}", mi + 1))
+                                .font(FontId::monospace(11.0))
+                                .color(TEXT_MED));
+                            if ui.small_button(
+                                RichText::new("Copy").font(FontId::proportional(10.0)).color(TEXT_MED)
+                            ).clicked() {
+                                ui.output_mut(|o| o.copied_text = m.context.clone());
+                            }
+                        });
                         ui.add_space(2.0);
                         // Context wraps to full width
                         render_highlighted(ui, &m.context,
