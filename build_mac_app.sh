@@ -63,7 +63,9 @@ cat <<EOF > "$CONTENTS_DIR/Info.plist"
 </plist>
 EOF
 
-if [ -f "assets/doxgrep.png" ]; then
+if [ -f "assets/doxsearch.png" ]; then
+    cp assets/doxsearch.png "$RESOURCES_DIR/doxsearch.png"
+elif [ -f "assets/doxgrep.png" ]; then
     cp assets/doxgrep.png "$RESOURCES_DIR/doxsearch.png"
 fi
 

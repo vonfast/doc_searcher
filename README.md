@@ -2,14 +2,14 @@
 
 A blazingly fast, multi-threaded desktop document search tool built in **Rust** with a sleek GUI powered by **`egui`**.
 
-DoXsearch allows you to instantly search for text inside **DOCX**, **ODT**, and **PDF** documents across entire directory trees.
+DoXsearch allows you to instantly search for text inside **DOCX**, **ODT**, **PDF**, and **plain text files** (`.txt`, `.md`, `.csv`, `.log`, `.json`, `.xml`, `.yaml`, `.toml`, etc.) across entire directory trees.
 
 ---
 
 ## Key Features
 
 -  **Multi-Threaded Parallel Search Engine** — Powered by `rayon` to utilize all CPU cores for lightning-fast text extraction and scanning.
--  **Multi-Format Support** — Deep text extraction from Microsoft Word (`.docx`), OpenDocument Text (`.odt`), and Adobe PDF (`.pdf`) files.
+-  **Multi-Format Support** — Deep text extraction from Microsoft Word (`.docx`, `.docm`), OpenDocument (`.odt`, `.ods`, `.odp`), Adobe PDF (`.pdf`), and text documents (`.txt`, `.md`, `.csv`, `.json`, `.log`, `.xml`, `.yaml`, `.toml`, etc.).
 -  **Memory-Efficient Case Matching** — Optimized zero-allocation case-insensitive search algorithm designed to prevent memory thrashing on large document stores.
 -  **Date & Relevance Sorting** — Sort matching files by Modification Date (newest/oldest first), File Name (A-Z), or Match Count.
 -  **Smooth Real-Time Progress Bar** — Non-flickering animated progress bar with live completion percentage and processed file counters.
