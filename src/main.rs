@@ -3,8 +3,7 @@ mod search;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use eframe::egui;
 use egui::{Color32, FontId, RichText, Vec2};
-use search::{SearchError, SearchOptions, SearchResult};
-use std::path::PathBuf;
+use search::{DocumentCache, SearchError, SearchOptions, SearchResult};
 use std::thread;
 
 const BLUE_DARK:  Color32 = Color32::from_rgb(30,  58,  138);
@@ -18,10 +17,9 @@ const TEXT_MED:   Color32 = Color32::from_rgb(71,  85,  105);
 
 enum SearchMessage {
     Progress { processed: usize, total: usize },
-    Done {
-        results: Vec<SearchResult>,
-        errors: Vec<SearchError>,
-    },
+    MatchFound(SearchResult),
+    ErrorFound(SearchError),
+    Done,
     Error(String),
 }
 
@@ -91,7 +89,7 @@ struct DoXsearchApp {
     progress_count: (usize, usize),
     selected_result: Option<usize>,
     sort_order: SortOrder,
-    tx: Sender<SearchMessage>,
+    cache: DocumentCache,
     rx: Receiver<SearchMessage>,
 }
 
@@ -112,7 +110,7 @@ impl DoXsearchApp {
             progress_count: (0, 0),
             selected_result: None,
             sort_order: SortOrder::DateDesc,
-            tx, rx,
+            cache: DocumentCache::new(),
         }
     }
 
@@ -166,14 +164,25 @@ impl DoXsearchApp {
         self.progress_count = (0, 0);
 
         let opts = self.opts.clone();
-        let tx = self.tx.clone();
+        let cache = self.cache.clone();
         thread::spawn(move || {
-            let tx_p = tx.clone();
-            match search::search_directory(&opts, move |processed, total| {
-                let _ = tx_p.try_send(SearchMessage::Progress { processed, total });
-            }) {
-                Ok((results, errors)) => {
-                    let _ = tx.send(SearchMessage::Done { results, errors });
+            let tx_match = tx.clone();
+            let tx_err = tx.clone();
+            let tx_prog = tx.clone();
+            match search::search_directory(
+                &opts,
+                &cache,
+                    let _ = tx_match.send(SearchMessage::MatchFound(result));
+                },
+                move |error| {
+                    let _ = tx_err.send(SearchMessage::ErrorFound(error));
+                },
+                move |processed, total| {
+                    let _ = tx_prog.try_send(SearchMessage::Progress { processed, total });
+                },
+            ) {
+                Ok(()) => {
+                    let _ = tx.send(SearchMessage::Done);
                 }
                 Err(e) => {
                     let _ = tx.send(SearchMessage::Error(e.to_string()));
@@ -194,17 +203,28 @@ impl DoXsearchApp {
 
     fn poll_messages(&mut self, ctx: &egui::Context) {
         let mut got_msg = false;
+        let mut new_matches = false;
         while let Ok(msg) = self.rx.try_recv() {
             got_msg = true;
             match msg {
-                SearchMessage::Progress { processed, total } => self.progress_count = (processed, total),
-                SearchMessage::Done { results, errors } => {
-                    self.results = results;
-                    self.errors = errors;
+                SearchMessage::Progress { processed, total } => {
+                    self.progress_count = (processed, total);
+                }
+                SearchMessage::MatchFound(result) => {
+                    self.results.push(result);
+                    new_matches = true;
+                    if self.selected_result.is_none() {
+                        self.selected_result = Some(0);
+                    }
+                }
+                SearchMessage::ErrorFound(err) => {
+                    self.errors.push(err);
+                }
+                SearchMessage::Done => {
                     self.sort_results();
                     self.state = SearchState::Done;
                     self.progress_count = (0, 0);
-                    if !self.results.is_empty() {
+                    if !self.results.is_empty() && self.selected_result.is_none() {
                         self.selected_result = Some(0);
                     }
                 }
@@ -213,6 +233,9 @@ impl DoXsearchApp {
                     self.state = SearchState::Idle;
                 }
             }
+        }
+        if new_matches {
+            self.sort_results();
         }
         if got_msg {
             ctx.request_repaint();
@@ -296,10 +319,10 @@ impl eframe::App for DoXsearchApp {
                             ui.add_space(4.0);
                             ui.checkbox(&mut self.opts.ignore_case, "Ignore case");
                             ui.checkbox(&mut self.opts.recursive, "Recursive search");
-                            ui.add_space(6.0);
+                            ui.checkbox(&mut self.opts.search_hidden, "Search hidden folders");
+                            ui.checkbox(&mut self.opts.use_cache, "Use memory cache");
 
-                            ui.label(RichText::new("File types:").color(TEXT_MED));
-                            ui.add_space(4.0);
+                            let cache_len = self.cache.len();
                             ui.horizontal(|ui| {
                                 ftbtn(ui, &mut self.opts.search_docx, "DOCX", BLUE_MED);
                                 ftbtn(ui, &mut self.opts.search_odt,  "ODT",  GREEN);
