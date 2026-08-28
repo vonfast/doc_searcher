@@ -510,12 +510,51 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
         let is_dir = canonical.is_dir();
 
         // 1. Ensisijainen: Kevyt D-Bus IPC (org.freedesktop.FileManager1) zbus-kirjaston kautta.
-        // Ei luo uutta prosessia ja käyttää erillistä säiettä sekä 1.5 sekunnin aikakatkaisua.
+        // Ei luo uutta prosessia ja pyytää taustalla olevaa tiedostonhallintaa korostamaan kohteen.
         match show_in_file_manager_dbus(&uri, is_dir) {
             Ok(()) => Ok(()),
             Err(dbus_err) => {
-                eprintln!("[DoXsearch] D-Bus FileManager1 failed: {dbus_err}. Falling back to default handler...");
-                // 2. Varatapa: Avaa kansio järjestelmän oletuskäsittelijällä (xdg-open via open::that)
+                eprintln!("[DoXsearch] D-Bus FileManager1 failed: {dbus_err}. Falling back to CLI selection...");
+
+                // 2. Toissijainen varatapa: Jos D-Bus ei ole käytettävissä (esim. SSH, rikkinäinen väylä tai rajoitettu Flatpak),
+                // yritetään suoraa tiedostonhallintakomentoa valintalipun (--select) kera kohteen korostamiseksi.
+                let fm = detect_linux_file_manager();
+                let cli_spawn_ok = match fm {
+                    LinuxFileManager::Dolphin => {
+                        std::process::Command::new("dolphin")
+                            .arg("--select")
+                            .arg(&canonical)
+                            .spawn()
+                            .is_ok()
+                    }
+                    LinuxFileManager::Nautilus => {
+                        std::process::Command::new("nautilus")
+                            .arg("--select")
+                            .arg(&canonical)
+                            .spawn()
+                            .is_ok()
+                    }
+                    LinuxFileManager::Nemo => {
+                        std::process::Command::new("nemo")
+                            .arg(&canonical)
+                            .spawn()
+                            .is_ok()
+                    }
+                    LinuxFileManager::Thunar => {
+                        let parent = if is_dir { &canonical } else { canonical.parent().unwrap_or(&canonical) };
+                        std::process::Command::new("thunar")
+                            .arg(parent)
+                            .spawn()
+                            .is_ok()
+                    }
+                    LinuxFileManager::Generic => false,
+                };
+
+                if cli_spawn_ok {
+                    return Ok(());
+                }
+
+                // 3. Viimeinen varatapa: Avaa kansio järjestelmän yleisellä oletuskäsittelijällä (xdg-open via open::that)
                 let target = if is_dir {
                     &canonical
                 } else {
