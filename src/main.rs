@@ -6,6 +6,7 @@ use egui::{Color32, FontId, RichText, Vec2};
 use search::{DocumentCache, SearchError, SearchOptions, SearchResult, SearchStats};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::OnceLock;
 use std::thread;
 
@@ -499,6 +500,7 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
                 if std::process::Command::new("dolphin")
                     .arg("--select")
                     .arg(&canonical)
+                    .stderr(Stdio::null())
                     .spawn()
                     .is_ok()
                 {
@@ -509,6 +511,7 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
                 if std::process::Command::new("nautilus")
                     .arg("--select")
                     .arg(&canonical)
+                    .stderr(Stdio::null())
                     .spawn()
                     .is_ok()
                 {
@@ -518,6 +521,7 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
             LinuxFileManager::Nemo => {
                 if std::process::Command::new("nemo")
                     .arg(&canonical)
+                    .stderr(Stdio::null())
                     .spawn()
                     .is_ok()
                 {
@@ -539,6 +543,7 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
                 &format!("array:string:{}", uri),
                 "string:",
             ])
+            .stderr(Stdio::null())
             .status();
 
         if let Ok(status) = dbus_result {
