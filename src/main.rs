@@ -554,6 +554,7 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
         match show_in_file_manager_dbus(&uri, is_dir) {
             Ok(()) => Ok(()),
             Err(dbus_err) => {
+                #[cfg(debug_assertions)]
                 eprintln!("[DoXsearch] D-Bus FileManager1 failed: {dbus_err}. Falling back to CLI selection...");
 
                 // 2. Toissijainen varatapa: Jos D-Bus ei ole käytettävissä (esim. SSH, rikkinäinen väylä tai rajoitettu Flatpak),
@@ -564,6 +565,9 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
                         std::process::Command::new("dolphin")
                             .arg("--select")
                             .arg(&canonical)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
                             .spawn()
                             .is_ok()
                     }
@@ -571,12 +575,18 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
                         std::process::Command::new("nautilus")
                             .arg("--select")
                             .arg(&canonical)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
                             .spawn()
                             .is_ok()
                     }
                     LinuxFileManager::Nemo => {
                         std::process::Command::new("nemo")
                             .arg(&canonical)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
                             .spawn()
                             .is_ok()
                     }
@@ -584,6 +594,9 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
                         let parent = if is_dir { &canonical } else { canonical.parent().unwrap_or(&canonical) };
                         std::process::Command::new("thunar")
                             .arg(parent)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
                             .spawn()
                             .is_ok()
                     }
@@ -1007,31 +1020,54 @@ impl DoXsearchApp {
     fn open_in_file_manager_async(&self, path: &Path, ctx: &egui::Context) {
         let path = path.to_path_buf();
         let tx = self.tx.clone();
-        let ctx = ctx.clone();
-        thread::Builder::new()
+        let ctx_thread = ctx.clone();
+        let lang = self.lang;
+        if let Err(e) = thread::Builder::new()
             .name("show-in-fm".to_string())
             .spawn(move || {
-                if let Err(e) = show_in_file_manager(&path) {
-                    let _ = tx.send(SearchMessage::UiError(e));
-                    ctx.request_repaint();
+                if let Err(err_msg) = show_in_file_manager(&path) {
+                    let _ = tx.send(SearchMessage::UiError(err_msg));
+                    ctx_thread.request_repaint();
                 }
             })
-            .ok();
+        {
+            let spawn_err = if lang == AppLanguage::Finnish {
+                format!("Taustasäikeen luonti epäonnistui: {e}")
+            } else {
+                format!("Failed to spawn worker thread: {e}")
+            };
+            let _ = self.tx.send(SearchMessage::UiError(spawn_err));
+            ctx.request_repaint();
+        }
     }
 
     fn open_file_async(&self, path: &Path, ctx: &egui::Context) {
         let path = path.to_path_buf();
         let tx = self.tx.clone();
-        let ctx = ctx.clone();
-        thread::Builder::new()
+        let ctx_thread = ctx.clone();
+        let lang = self.lang;
+        if let Err(e) = thread::Builder::new()
             .name("open-file".to_string())
             .spawn(move || {
-                if let Err(e) = open::that(&path) {
-                    let _ = tx.send(SearchMessage::UiError(format!("Failed to open file: {}", e)));
-                    ctx.request_repaint();
+                if let Err(err) = open::that(&path) {
+                    let msg = if lang == AppLanguage::Finnish {
+                        format!("Tiedoston avaaminen epäonnistui: {err}")
+                    } else {
+                        format!("Failed to open file: {err}")
+                    };
+                    let _ = tx.send(SearchMessage::UiError(msg));
+                    ctx_thread.request_repaint();
                 }
             })
-            .ok();
+        {
+            let spawn_err = if lang == AppLanguage::Finnish {
+                format!("Taustasäikeen luonti epäonnistui: {e}")
+            } else {
+                format!("Failed to spawn worker thread: {e}")
+            };
+            let _ = self.tx.send(SearchMessage::UiError(spawn_err));
+            ctx.request_repaint();
+        }
     }
 
     fn total_matches(&self) -> usize {
@@ -1592,10 +1628,18 @@ impl eframe::App for DoXsearchApp {
                                                 .color(GRAY_BORDER),
                                         );
                                     }
-                                    let matches_count = if self.lang == AppLanguage::Finnish {
-                                        format!("{} osumaa", result.matches.len())
+                                    let matches_count = if result.matches.len() >= search::MAX_MATCHES_PER_FILE {
+                                        if self.lang == AppLanguage::Finnish {
+                                            format!("{}+ osumaa", search::MAX_MATCHES_PER_FILE)
+                                        } else {
+                                            format!("{}+ matches", search::MAX_MATCHES_PER_FILE)
+                                        }
                                     } else {
-                                        format!("{} matches", result.matches.len())
+                                        if self.lang == AppLanguage::Finnish {
+                                            format!("{} osumaa", result.matches.len())
+                                        } else {
+                                            format!("{} matches", result.matches.len())
+                                        }
                                     };
                                     ui.label(
                                         RichText::new(matches_count)
@@ -1704,10 +1748,18 @@ impl eframe::App for DoXsearchApp {
             ui.horizontal(|ui| {
                 ui.heading(RichText::new(&fname).color(TEXT_DARK));
                 ui.add_space(8.0);
-                let header_matches = if self.lang == AppLanguage::Finnish {
-                    format!("— {} osumaa", result.matches.len())
+                let header_matches = if result.matches.len() >= search::MAX_MATCHES_PER_FILE {
+                    if self.lang == AppLanguage::Finnish {
+                        format!("— {}+ osumaa", search::MAX_MATCHES_PER_FILE)
+                    } else {
+                        format!("— {}+ matches", search::MAX_MATCHES_PER_FILE)
+                    }
                 } else {
-                    format!("— {} matches", result.matches.len())
+                    if self.lang == AppLanguage::Finnish {
+                        format!("— {} osumaa", result.matches.len())
+                    } else {
+                        format!("— {} matches", result.matches.len())
+                    }
                 };
                 ui.label(RichText::new(header_matches).color(TEXT_MED));
                 ui.add_space(16.0);
