@@ -443,69 +443,70 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        let fm = detect_linux_file_manager();
-
-        // 1. Direct invocation based on detected file manager:
-        match fm {
-            LinuxFileManager::Dolphin => {
-                if std::process::Command::new("dolphin")
-                    .arg("--select")
-                    .arg(&canonical)
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .is_ok()
-                {
-                    return Ok(());
-                }
-            }
-            LinuxFileManager::Nautilus => {
-                if std::process::Command::new("nautilus")
-                    .arg("--select")
-                    .arg(&canonical)
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .is_ok()
-                {
-                    return Ok(());
-                }
-            }
-            LinuxFileManager::Nemo => {
-                if std::process::Command::new("nemo")
-                    .arg(&canonical)
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .is_ok()
-                {
-                    return Ok(());
-                }
-            }
-            _ => {}
-        }
-
-        // 2. Try DBus org.freedesktop.FileManager1.ShowItems
         let uri = path_to_file_uri(&canonical);
-        let dbus_result = std::process::Command::new("dbus-send")
-            .args([
-                "--session",
-                "--dest=org.freedesktop.FileManager1",
-                "--type=method_call",
-                "/org/freedesktop/FileManager1",
-                "org.freedesktop.FileManager1.ShowItems",
-                &format!("array:string:{}", uri),
-                "string:",
-            ])
-            .stderr(Stdio::null())
-            .status();
+        let is_dir = canonical.is_dir();
 
-        if let Ok(status) = dbus_result {
-            if status.success() {
-                return Ok(());
+        // 1. Ensisijainen: Kevyt D-Bus IPC (org.freedesktop.FileManager1) ilman uuden prosessin luontia.
+        // Pyytää taustalla jo käynnissä olevaa tiedostonhallintaa (Dolphin, Nautilus, Nemo, Thunar jne.)
+        // avaamaan tai korostamaan polun suoraan istuntoväylän (session bus) kautta.
+        if let Ok(conn) = zbus::blocking::Connection::session() {
+            let methods = if is_dir {
+                ["ShowFolders", "ShowItems"]
+            } else {
+                ["ShowItems", "ShowFolders"]
+            };
+
+            for method in methods {
+                let uris = [uri.as_str()];
+                if conn
+                    .call_method(
+                        Some("org.freedesktop.FileManager1"),
+                        "/org/freedesktop/FileManager1",
+                        Some("org.freedesktop.FileManager1"),
+                        method,
+                        &(uris.as_slice(), ""),
+                    )
+                    .is_ok()
+                {
+                    return Ok(());
+                }
             }
         }
 
-        // 3. Fallback: open parent folder with default file manager
-        let parent = canonical.parent().unwrap_or(&canonical);
-        open::that(parent).map_err(|e| format!("Failed to open folder: {e}"))
+        // 2. Toissijainen IPC-varatapa: dbus-send komentorivityökalulla
+        let dbus_methods = if is_dir {
+            ["ShowFolders", "ShowItems"]
+        } else {
+            ["ShowItems", "ShowFolders"]
+        };
+
+        for method in dbus_methods {
+            if let Ok(status) = std::process::Command::new("dbus-send")
+                .args([
+                    "--session",
+                    "--dest=org.freedesktop.FileManager1",
+                    "--type=method_call",
+                    "/org/freedesktop/FileManager1",
+                    &format!("org.freedesktop.FileManager1.{}", method),
+                    &format!("array:string:{}", uri),
+                    "string:",
+                ])
+                .stderr(Stdio::null())
+                .status()
+            {
+                if status.success() {
+                    return Ok(());
+                }
+            }
+        }
+
+        // 3. Viimeinen varajärjestelmä: Avaa kansion oletuskäsittelijällä (xdg-open via open::that)
+        let target = if is_dir {
+            &canonical
+        } else {
+            canonical.parent().unwrap_or(&canonical)
+        };
+        open::that(target).map_err(|e| format!("Failed to open folder: {e}"))
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
@@ -2022,5 +2023,13 @@ mod tests {
         assert_eq!(app.current_search_id, 2);
         assert_eq!(app.state, SearchState::Idle);
         assert!(app.status_info.is_some());
+    }
+
+    #[test]
+    fn test_show_in_file_manager_nonexistent_returns_err() {
+        let non_existent = Path::new("/this/path/absolutely/does/not/exist/doxsearch_12345.xyz");
+        let result = show_in_file_manager(non_existent);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("does not exist"));
     }
 }
