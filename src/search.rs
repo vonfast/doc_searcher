@@ -17,64 +17,211 @@ pub struct CacheKey {
     pub modified: Option<std::time::SystemTime>,
 }
 
-const MAX_CACHE_TOTAL_BYTES: usize = 64 * 1024 * 1024; // 64 MB
-const MAX_CACHED_ENTRY_BYTES: usize = 1024 * 1024;     // 1 MB per file
-const MAX_CACHE_ENTRIES: usize = 500;
+const NUM_SHARDS: usize = 16;
+pub const MAX_CACHE_TOTAL_BYTES: usize = 256 * 1024 * 1024; // 256 MB
+pub const MAX_CACHED_ENTRY_BYTES: usize = 5 * 1024 * 1024;   // 5 MB per file
+pub const MAX_CACHE_ENTRIES: usize = 10_000;
+const MAX_SHARD_BYTES: usize = MAX_CACHE_TOTAL_BYTES / NUM_SHARDS;
+const MAX_SHARD_ENTRIES: usize = MAX_CACHE_ENTRIES / NUM_SHARDS;
 
-#[derive(Clone, Default)]
+pub fn clean_path(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        p
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchCandidate {
+    pub path: PathBuf,
+    pub ext: String,
+    pub size: u64,
+    pub modified: Option<std::time::SystemTime>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DirectorySnapshot {
+    pub candidates: Vec<SearchCandidate>,
+    #[allow(dead_code)]
+    pub created_at: std::time::Instant,
+    pub recursive: bool,
+    pub search_hidden: bool,
+    pub search_docx: bool,
+    pub search_odt: bool,
+    pub search_pdf: bool,
+    pub search_txt: bool,
+    pub max_file_size_mb: Option<u64>,
+}
+
+impl DirectorySnapshot {
+    pub fn matches_opts(&self, opts: &SearchOptions) -> bool {
+        self.recursive == opts.recursive
+            && self.search_hidden == opts.search_hidden
+            && self.search_docx == opts.search_docx
+            && self.search_odt == opts.search_odt
+            && self.search_pdf == opts.search_pdf
+            && self.search_txt == opts.search_txt
+            && self.max_file_size_mb == opts.max_file_size_mb
+    }
+}
+
+#[derive(Default)]
+struct CacheShard {
+    entries: HashMap<CacheKey, Arc<str>>,
+    total_bytes: usize,
+}
+
+impl CacheShard {
+    #[inline]
+    fn entry_size(key: &CacheKey, text: &str) -> usize {
+        std::mem::size_of::<CacheKey>() + key.path.as_os_str().len() + text.len()
+    }
+
+    fn get(&self, key: &CacheKey) -> Option<Arc<str>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: CacheKey, text: Arc<str>) {
+        if text.len() > MAX_CACHED_ENTRY_BYTES {
+            return;
+        }
+
+        let new_entry_size = Self::entry_size(&key, &text);
+
+        // If key already existed, subtract old size first
+        if let Some(old_val) = self.entries.remove(&key) {
+            let old_size = Self::entry_size(&key, &old_val);
+            self.total_bytes = self.total_bytes.saturating_sub(old_size);
+        }
+
+        // If exceeding max entries or total bytes in this shard, prune down by 20% (keep 80%)
+        if self.entries.len() >= MAX_SHARD_ENTRIES || self.total_bytes + new_entry_size > MAX_SHARD_BYTES {
+            let target_bytes = (MAX_SHARD_BYTES * 8) / 10;
+            let target_entries = (MAX_SHARD_ENTRIES * 8) / 10;
+            let keys_to_remove: Vec<CacheKey> = self.entries.keys().cloned().collect();
+            for k in keys_to_remove {
+                if let Some(v) = self.entries.remove(&k) {
+                    let rem_size = Self::entry_size(&k, &v);
+                    self.total_bytes = self.total_bytes.saturating_sub(rem_size);
+                }
+                if self.total_bytes <= target_bytes && self.entries.len() <= target_entries {
+                    break;
+                }
+            }
+        }
+
+        self.total_bytes = self.total_bytes.saturating_add(new_entry_size);
+        self.entries.insert(key, text);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.total_bytes = 0;
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+}
+
 pub struct DocumentCache {
-    entries: Arc<RwLock<HashMap<CacheKey, Arc<str>>>>,
+    shards: Arc<[RwLock<CacheShard>; NUM_SHARDS]>,
+    dir_snapshots: Arc<RwLock<HashMap<PathBuf, DirectorySnapshot>>>,
+}
+
+impl Clone for DocumentCache {
+    fn clone(&self) -> Self {
+        Self {
+            shards: Arc::clone(&self.shards),
+            dir_snapshots: Arc::clone(&self.dir_snapshots),
+        }
+    }
+}
+
+impl Default for DocumentCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DocumentCache {
     pub fn new() -> Self {
-        Self::default()
+        let shards: [RwLock<CacheShard>; NUM_SHARDS] = Default::default();
+        Self {
+            shards: Arc::new(shards),
+            dir_snapshots: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    #[inline]
+    fn shard_index(key: &CacheKey) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % NUM_SHARDS
     }
 
     pub fn get(&self, key: &CacheKey) -> Option<Arc<str>> {
-        let guard = self.entries.read().ok()?;
-        guard.get(key).cloned()
+        let idx = Self::shard_index(key);
+        let guard = self.shards[idx].read().ok()?;
+        guard.get(key)
     }
 
     pub fn insert(&self, key: CacheKey, text: Arc<str>) {
-        // Only cache documents up to 1 MB of text to prevent memory ballooning
-        if text.len() > MAX_CACHED_ENTRY_BYTES {
-            return;
-        }
-        if let Ok(mut guard) = self.entries.write() {
-            let mut current_bytes: usize = guard
-                .iter()
-                .map(|(k, v)| std::mem::size_of::<CacheKey>() + k.path.as_os_str().len() + v.len())
-                .sum();
-
-            let entry_bytes = std::mem::size_of::<CacheKey>() + key.path.as_os_str().len() + text.len();
-
-            // If exceeding max entries or total bytes, prune down
-            if guard.len() >= MAX_CACHE_ENTRIES || current_bytes + entry_bytes > MAX_CACHE_TOTAL_BYTES {
-                let target_bytes = MAX_CACHE_TOTAL_BYTES / 2;
-                let keys_to_remove: Vec<CacheKey> = guard.keys().cloned().collect();
-                for k in keys_to_remove {
-                    if let Some(v) = guard.remove(&k) {
-                        let rem_size = std::mem::size_of::<CacheKey>() + k.path.as_os_str().len() + v.len();
-                        current_bytes = current_bytes.saturating_sub(rem_size);
-                    }
-                    if current_bytes <= target_bytes && guard.len() < (MAX_CACHE_ENTRIES / 2) {
-                        break;
-                    }
-                }
-            }
+        let idx = Self::shard_index(&key);
+        if let Ok(mut guard) = self.shards[idx].write() {
             guard.insert(key, text);
         }
     }
 
+    pub fn get_snapshot(&self, dir: &Path, opts: &SearchOptions) -> Option<Vec<SearchCandidate>> {
+        let guard = self.dir_snapshots.read().ok()?;
+        let snap = guard.get(dir)?;
+        if snap.matches_opts(opts) {
+            Some(snap.candidates.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn store_snapshot(&self, dir: PathBuf, opts: &SearchOptions, candidates: Vec<SearchCandidate>) {
+        if let Ok(mut guard) = self.dir_snapshots.write() {
+            guard.insert(dir, DirectorySnapshot {
+                candidates,
+                created_at: std::time::Instant::now(),
+                recursive: opts.recursive,
+                search_hidden: opts.search_hidden,
+                search_docx: opts.search_docx,
+                search_odt: opts.search_odt,
+                search_pdf: opts.search_pdf,
+                search_txt: opts.search_txt,
+                max_file_size_mb: opts.max_file_size_mb,
+            });
+        }
+    }
+
     pub fn clear(&self) {
-        if let Ok(mut guard) = self.entries.write() {
+        for shard in self.shards.iter() {
+            if let Ok(mut guard) = shard.write() {
+                guard.clear();
+            }
+        }
+        if let Ok(mut guard) = self.dir_snapshots.write() {
             guard.clear();
         }
     }
 
     pub fn len(&self) -> usize {
-        self.entries.read().map(|g| g.len()).unwrap_or(0)
+        self.shards
+            .iter()
+            .map(|shard| shard.read().map(|g| g.len()).unwrap_or(0))
+            .sum()
     }
 
     #[allow(dead_code)]
@@ -83,14 +230,10 @@ impl DocumentCache {
     }
 
     pub fn memory_usage_bytes(&self) -> usize {
-        if let Ok(guard) = self.entries.read() {
-            guard
-                .iter()
-                .map(|(k, v)| std::mem::size_of::<CacheKey>() + k.path.as_os_str().len() + v.len())
-                .sum()
-        } else {
-            0
-        }
+        self.shards
+            .iter()
+            .map(|shard| shard.read().map(|g| g.total_bytes()).unwrap_or(0))
+            .sum()
     }
 }
 
@@ -157,27 +300,13 @@ pub struct SearchStats {
     pub duration: std::time::Duration,
 }
 
-#[derive(Debug)]
-struct SearchCandidate {
-    path: PathBuf,
-    ext: String,
-    size: u64,
-    modified: Option<std::time::SystemTime>,
-}
-
-pub fn search_directory(
+fn scan_candidates(
+    canonical_root: &Path,
     opts: &SearchOptions,
-    cache: &DocumentCache,
     is_cancelled: Option<&std::sync::atomic::AtomicBool>,
-    on_match: impl Fn(SearchResult) + Sync + Send,
-    on_error: impl Fn(SearchError) + Sync + Send,
-    progress_cb: impl Fn(usize, usize) + Sync + Send,
-) -> Result<SearchStats> {
-    let start_time = std::time::Instant::now();
+) -> Vec<SearchCandidate> {
     let max_depth = if opts.recursive { usize::MAX } else { 1 };
-    let canonical_root = opts.directory.canonicalize().unwrap_or_else(|_| opts.directory.clone());
-
-    let entries: Vec<SearchCandidate> = WalkDir::new(&canonical_root)
+    WalkDir::new(canonical_root)
         .max_depth(max_depth)
         .into_iter()
         .filter_entry(|e| {
@@ -189,8 +318,8 @@ pub fn search_directory(
             if e.depth() == 0 {
                 return true;
             }
-            let is_dir = e.file_type().is_dir() || (e.file_type().is_symlink() && e.path().is_dir());
-            let is_file = e.file_type().is_file() || (e.file_type().is_symlink() && e.path().is_file());
+            let ft = e.file_type();
+            let is_dir = ft.is_dir() || (ft.is_symlink() && e.path().is_dir());
             let name = e.file_name().to_string_lossy();
 
             if !opts.search_hidden && name.starts_with('.') {
@@ -216,41 +345,45 @@ pub fn search_directory(
                 {
                     return false;
                 }
-            } else if is_file {
-                let ext = e.path()
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
+            } else {
+                let is_file = ft.is_file() || (ft.is_symlink() && e.path().is_file());
+                if is_file {
+                    let ext = e.path()
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
 
-                let matches_type = match ext.as_str() {
-                    "docx" | "docm" | "dotx" | "dotm" => opts.search_docx,
-                    "odt" | "ott" | "ods" | "odp" | "fodt" | "fods" => opts.search_odt,
-                    "pdf" => opts.search_pdf,
-                    "txt" | "text" => opts.search_txt,
-                    _ => false,
-                };
+                    let matches_type = match ext.as_str() {
+                        "docx" | "docm" | "dotx" | "dotm" => opts.search_docx,
+                        "odt" | "ott" | "ods" | "odp" | "fodt" | "fods" => opts.search_odt,
+                        "pdf" => opts.search_pdf,
+                        "txt" | "text" => opts.search_txt,
+                        _ => false,
+                    };
 
-                if !matches_type {
-                    return false;
+                    if !matches_type {
+                        return false;
+                    }
                 }
             }
             true
         })
         .filter_map(|e| e.ok())
         .filter_map(|e| {
-            if !e.file_type().is_file() && !e.path().is_file() {
+            let ft = e.file_type();
+            if !(ft.is_file() || (ft.is_symlink() && e.path().is_file())) {
                 return None;
             }
-            let path = e.path();
-            let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-            let ext = canonical_path
+            let meta_res = e.metadata().ok();
+            let path = clean_path(e.into_path());
+            let ext = path
                 .extension()
                 .and_then(|ext| ext.to_str())
                 .unwrap_or("")
                 .to_lowercase();
 
-            let meta = e.metadata().or_else(|_| std::fs::metadata(path)).ok();
+            let meta = meta_res.or_else(|| std::fs::metadata(&path).ok());
             let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
             let modified = meta.and_then(|m| m.modified().ok());
 
@@ -261,21 +394,47 @@ pub fn search_directory(
                 }
             }
 
-            if let Some(after) = opts.modified_after {
-                match modified {
-                    Some(mtime) if mtime >= after => {}
-                    _ => return None,
-                }
-            }
-
             Some(SearchCandidate {
-                path: canonical_path,
+                path,
                 ext,
                 size,
                 modified,
             })
         })
-        .collect();
+        .collect()
+}
+
+pub fn search_directory(
+    opts: &SearchOptions,
+    cache: &DocumentCache,
+    is_cancelled: Option<&std::sync::atomic::AtomicBool>,
+    on_match: impl Fn(SearchResult) + Sync + Send,
+    on_error: impl Fn(SearchError) + Sync + Send,
+    progress_cb: impl Fn(usize, usize) + Sync + Send,
+) -> Result<SearchStats> {
+    let start_time = std::time::Instant::now();
+    let canonical_root = opts.directory.canonicalize().unwrap_or_else(|_| opts.directory.clone());
+
+    let all_candidates: Vec<SearchCandidate> = if opts.use_cache {
+        if let Some(cached) = cache.get_snapshot(&canonical_root, opts) {
+            cached
+        } else {
+            let scanned = scan_candidates(&canonical_root, opts, is_cancelled);
+            cache.store_snapshot(canonical_root.clone(), opts, scanned.clone());
+            scanned
+        }
+    } else {
+        scan_candidates(&canonical_root, opts, is_cancelled)
+    };
+
+    let entries: Vec<SearchCandidate> = if let Some(after) = opts.modified_after {
+        all_candidates
+            .into_iter()
+            .filter(|c| matches!(c.modified, Some(mtime) if mtime >= after))
+            .collect()
+    } else {
+        all_candidates
+    };
 
     let total = entries.len();
     progress_cb(0, total);
@@ -384,15 +543,15 @@ const MAX_PLAIN_TEXT_FILE_SIZE: u64 = 25 * 1024 * 1024; // 25 MB max
 
 /// Extract text from plain text files (.txt, .md, .csv, .log, .json)
 pub fn extract_plain_text(path: &Path) -> Result<String> {
-    let file_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    if file_len > MAX_PLAIN_TEXT_FILE_SIZE {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("Could not read file: {}", path.display()))?;
+
+    if bytes.len() as u64 > MAX_PLAIN_TEXT_FILE_SIZE {
         return Err(anyhow::anyhow!(
             "Tekstitiedosto on liian suuri (>25 MB): {}",
             path.display()
         ));
     }
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("Could not read file: {}", path.display()))?;
 
     if bytes.is_empty() {
         return Ok(String::new());
@@ -451,43 +610,45 @@ pub fn extract_docx(path: &Path) -> Result<String> {
     let mut archive = ZipArchive::new(std::io::BufReader::new(file))
         .with_context(|| format!("Could not read ZIP archive: {}", path.display()))?;
 
-    // Collect all XML parts: word/document.xml, word/header*.xml, word/footer*.xml, word/footnotes.xml, word/endnotes.xml, word/comments.xml
-    let mut xml_names: Vec<String> = archive
-        .file_names()
-        .filter(|name| {
+    // Collect all XML parts by index: word/document.xml, word/header*.xml, word/footer*.xml, word/footnotes.xml, word/endnotes.xml, word/comments.xml
+    let mut xml_entries: Vec<(usize, String)> = Vec::new();
+    for i in 0..archive.len() {
+        if let Ok(file) = archive.by_index(i) {
+            let name = file.name();
             let n = name.replace('\\', "/").to_lowercase();
-            n.starts_with("word/") && n.ends_with(".xml") && (
+            if n.starts_with("word/") && n.ends_with(".xml") && (
                 n == "word/document.xml"
                 || n.starts_with("word/header")
                 || n.starts_with("word/footer")
                 || n.starts_with("word/footnotes")
                 || n.starts_with("word/endnotes")
                 || n.starts_with("word/comments")
-            )
-        })
-        .map(|s| s.to_string())
-        .collect();
+            ) {
+                xml_entries.push((i, n));
+            }
+        }
+    }
 
-    if xml_names.is_empty() {
+    if xml_entries.is_empty() {
         return Err(anyhow::anyhow!("word/document.xml missing from docx: {}", path.display()));
     }
 
     // Ensure word/document.xml comes first
-    xml_names.sort_by(|a, b| {
-        let a_main = a.ends_with("document.xml");
-        let b_main = b.ends_with("document.xml");
+    xml_entries.sort_by(|a, b| {
+        let a_main = a.1.ends_with("document.xml");
+        let b_main = b.1.ends_with("document.xml");
         match (a_main, b_main) {
-            (true, true) => a.cmp(b),
+            (true, true) => a.1.cmp(&b.1),
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
-            (false, false) => a.cmp(b),
+            (false, false) => a.1.cmp(&b.1),
         }
     });
 
     let mut full_text = String::with_capacity(4096);
-    for xml_name in xml_names {
+    for (idx, xml_name) in xml_entries {
         let entry = archive
-            .by_name(&xml_name)
+            .by_index(idx)
             .with_context(|| format!("Could not read part {xml_name} in docx: {}", path.display()))?;
         let reader = Reader::from_reader(std::io::BufReader::new(entry));
         let part_text = extract_text_from_xml_reader(reader, true)
@@ -657,12 +818,12 @@ pub fn extract_text_from_xml(xml: &str) -> Result<String> {
 
 /// Extract text from a .pdf file with header sanitization, panic safety, and fallback stream parsing
 pub fn extract_pdf(path: &Path) -> Result<String> {
-    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > 100 * 1024 * 1024 {
-        return Err(anyhow::anyhow!("PDF-tiedosto on liian suuri (>100 MB): {}", path.display()));
-    }
-
     let bytes = std::fs::read(path)
         .with_context(|| format!("Could not read file: {}", path.display()))?;
+
+    if bytes.len() > 100 * 1024 * 1024 {
+        return Err(anyhow::anyhow!("PDF-tiedosto on liian suuri (>100 MB): {}", path.display()));
+    }
 
     if bytes.is_empty() {
         return Err(anyhow::anyhow!("Tiedosto on tyhjä (0 tavua)"));
@@ -1781,6 +1942,92 @@ mod tests {
         assert_eq!(results.len(), 1, "Only actual_doc.txt should match, all other extensions must be ignored");
         assert_eq!(results[0].file_type, "TXT");
         assert_eq!(stats.total_count, 1);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_sharded_cache_parallel_contention() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let cache = Arc::new(DocumentCache::new());
+        let mut handles = Vec::new();
+
+        for t in 0..16 {
+            let cache_clone = Arc::clone(&cache);
+            let handle = thread::spawn(move || {
+                for i in 0..100 {
+                    let key = CacheKey {
+                        path: PathBuf::from(format!("/tmp/parallel_doc_{}_{}.txt", t, i)),
+                        size: 500,
+                        modified: None,
+                    };
+                    let text: Arc<str> = format!("Tämä on säikeen {} dokumentti {}", t, i).into();
+                    cache_clone.insert(key.clone(), text.clone());
+                    let retrieved = cache_clone.get(&key);
+                    assert!(retrieved.is_some() || cache_clone.len() > 0);
+                }
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(cache.len() > 0);
+        assert!(cache.memory_usage_bytes() > 0);
+        assert!(cache.memory_usage_bytes() <= MAX_CACHE_TOTAL_BYTES);
+    }
+
+    #[test]
+    fn test_repeated_search_multi_file_directory_never_wipes_cache() {
+        let temp_dir = std::env::temp_dir().join(format!("doxsearch_multi_cache_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        for i in 0..60 {
+            let p = temp_dir.join(format!("file_{}.txt", i));
+            std::fs::write(&p, format!("Dokumentti {} sisältää hakusanan ja uniikkia tekstiä", i)).unwrap();
+        }
+
+        let cache = DocumentCache::new();
+        let opts1 = SearchOptions {
+            directory: temp_dir.clone(),
+            query: "hakusanan".to_string(),
+            use_cache: true,
+            ..Default::default()
+        };
+
+        // First search: 60 misses, 0 hits
+        let stats1 = search_directory(&opts1, &cache, None, |_| {}, |_| {}, |_, _| {}).unwrap();
+        assert_eq!(stats1.total_count, 60);
+        assert_eq!(stats1.cached_count, 0);
+        assert_eq!(cache.len(), 60, "All 60 files must be stored in cache");
+
+        // Second search with different query: 60 hits, 0 misses!
+        let opts2 = SearchOptions {
+            directory: temp_dir.clone(),
+            query: "uniikkia".to_string(),
+            use_cache: true,
+            ..Default::default()
+        };
+        let stats2 = search_directory(&opts2, &cache, None, |_| {}, |_| {}, |_, _| {}).unwrap();
+        assert_eq!(stats2.total_count, 60);
+        assert_eq!(stats2.cached_count, 60, "All 60 files must be served directly from cache");
+        assert_eq!(cache.len(), 60, "Cache must not be wiped or pruned");
+
+        // Third search with third query: still 100% cache hits!
+        let opts3 = SearchOptions {
+            directory: temp_dir.clone(),
+            query: "Dokumentti".to_string(),
+            use_cache: true,
+            ..Default::default()
+        };
+        let stats3 = search_directory(&opts3, &cache, None, |_| {}, |_| {}, |_, _| {}).unwrap();
+        assert_eq!(stats3.total_count, 60);
+        assert_eq!(stats3.cached_count, 60);
+        assert_eq!(cache.len(), 60);
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
