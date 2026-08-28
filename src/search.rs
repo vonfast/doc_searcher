@@ -19,7 +19,7 @@ pub struct CacheKey {
 
 const NUM_SHARDS: usize = 16;
 pub const MAX_CACHE_TOTAL_BYTES: usize = 256 * 1024 * 1024; // 256 MB
-pub const MAX_CACHED_ENTRY_BYTES: usize = 5 * 1024 * 1024;   // 5 MB per file
+pub const MAX_CACHED_ENTRY_BYTES: usize = 5 * 1024 * 1024; // 5 MB per file
 pub const MAX_CACHE_ENTRIES: usize = 10_000;
 const MAX_SHARD_BYTES: usize = MAX_CACHE_TOTAL_BYTES / NUM_SHARDS;
 const MAX_SHARD_ENTRIES: usize = MAX_CACHE_ENTRIES / NUM_SHARDS;
@@ -97,7 +97,9 @@ impl CacheShard {
         }
 
         // If exceeding max entries or total bytes in this shard, prune down by 20% (keep 80%)
-        if self.entries.len() >= MAX_SHARD_ENTRIES || self.total_bytes + new_entry_size > MAX_SHARD_BYTES {
+        if self.entries.len() >= MAX_SHARD_ENTRIES
+            || self.total_bytes + new_entry_size > MAX_SHARD_BYTES
+        {
             let target_bytes = (MAX_SHARD_BYTES * 8) / 10;
             let target_entries = (MAX_SHARD_ENTRIES * 8) / 10;
             let keys_to_remove: Vec<CacheKey> = self.entries.keys().cloned().collect();
@@ -190,19 +192,27 @@ impl DocumentCache {
         }
     }
 
-    pub fn store_snapshot(&self, dir: PathBuf, opts: &SearchOptions, candidates: Vec<SearchCandidate>) {
+    pub fn store_snapshot(
+        &self,
+        dir: PathBuf,
+        opts: &SearchOptions,
+        candidates: Vec<SearchCandidate>,
+    ) {
         if let Ok(mut guard) = self.dir_snapshots.write() {
-            guard.insert(dir, DirectorySnapshot {
-                candidates,
-                created_at: std::time::Instant::now(),
-                recursive: opts.recursive,
-                search_hidden: opts.search_hidden,
-                search_docx: opts.search_docx,
-                search_odt: opts.search_odt,
-                search_pdf: opts.search_pdf,
-                search_txt: opts.search_txt,
-                max_file_size_mb: opts.max_file_size_mb,
-            });
+            guard.insert(
+                dir,
+                DirectorySnapshot {
+                    candidates,
+                    created_at: std::time::Instant::now(),
+                    recursive: opts.recursive,
+                    search_hidden: opts.search_hidden,
+                    search_docx: opts.search_docx,
+                    search_odt: opts.search_odt,
+                    search_pdf: opts.search_pdf,
+                    search_txt: opts.search_txt,
+                    max_file_size_mb: opts.max_file_size_mb,
+                },
+            );
         }
     }
 
@@ -348,7 +358,8 @@ fn scan_candidates(
             } else {
                 let is_file = ft.is_file() || (ft.is_symlink() && e.path().is_file());
                 if is_file {
-                    let ext = e.path()
+                    let ext = e
+                        .path()
                         .extension()
                         .and_then(|ext| ext.to_str())
                         .unwrap_or("")
@@ -413,7 +424,10 @@ pub fn search_directory(
     progress_cb: impl Fn(usize, usize) + Sync + Send,
 ) -> Result<SearchStats> {
     let start_time = std::time::Instant::now();
-    let canonical_root = opts.directory.canonicalize().unwrap_or_else(|_| opts.directory.clone());
+    let canonical_root = opts
+        .directory
+        .canonicalize()
+        .unwrap_or_else(|_| opts.directory.clone());
 
     let all_candidates: Vec<SearchCandidate> = if opts.use_cache {
         if let Some(cached) = cache.get_snapshot(&canonical_root, opts) {
@@ -448,89 +462,93 @@ pub fn search_directory(
 
     let processed = std::sync::atomic::AtomicUsize::new(0);
     let cached_hits = std::sync::atomic::AtomicUsize::new(0);
-    let step = if total <= 100 { 1 } else { (total / 100).max(1) };
+    let step = if total <= 100 {
+        1
+    } else {
+        (total / 100).max(1)
+    };
 
-    entries
-        .into_par_iter()
-        .for_each(|candidate| {
-            if let Some(cancel) = is_cancelled {
-                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
+    entries.into_par_iter().for_each(|candidate| {
+        if let Some(cancel) = is_cancelled {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
             }
+        }
 
-            let cache_key = CacheKey {
-                path: candidate.path.clone(),
-                size: candidate.size,
-                modified: candidate.modified,
-            };
+        let cache_key = CacheKey {
+            path: candidate.path.clone(),
+            size: candidate.size,
+            modified: candidate.modified,
+        };
 
-            let text_result: Result<Arc<str>> = if opts.use_cache {
-                if let Some(cached) = cache.get(&cache_key) {
-                    cached_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Ok(cached)
-                } else {
-                    let raw_res = match candidate.ext.as_str() {
-                        "fodt" | "fods" => extract_flat_xml(&candidate.path),
-                        "docx" | "docm" | "dotx" | "dotm" => extract_docx(&candidate.path),
-                        "odt" | "ott" | "ods" | "odp" => extract_odt(&candidate.path),
-                        "pdf" => extract_pdf(&candidate.path),
-                        "txt" | "text" => extract_plain_text(&candidate.path),
-                        _ => return,
-                    };
-                    match raw_res {
-                        Ok(text) => {
-                            let arc_text: Arc<str> = text.into();
-                            cache.insert(cache_key, arc_text.clone());
-                            Ok(arc_text)
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
+        let text_result: Result<Arc<str>> = if opts.use_cache {
+            if let Some(cached) = cache.get(&cache_key) {
+                cached_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(cached)
             } else {
-                match candidate.ext.as_str() {
-                    "fodt" | "fods" => extract_flat_xml(&candidate.path).map(|t| t.into()),
-                    "docx" | "docm" | "dotx" | "dotm" => extract_docx(&candidate.path).map(|t| t.into()),
-                    "odt" | "ott" | "ods" | "odp" => extract_odt(&candidate.path).map(|t| t.into()),
-                    "pdf" => extract_pdf(&candidate.path).map(|t| t.into()),
-                    "txt" | "text" => extract_plain_text(&candidate.path).map(|t| t.into()),
+                let raw_res = match candidate.ext.as_str() {
+                    "fodt" | "fods" => extract_flat_xml(&candidate.path),
+                    "docx" | "docm" | "dotx" | "dotm" => extract_docx(&candidate.path),
+                    "odt" | "ott" | "ods" | "odp" => extract_odt(&candidate.path),
+                    "pdf" => extract_pdf(&candidate.path),
+                    "txt" | "text" => extract_plain_text(&candidate.path),
                     _ => return,
-                }
-            };
-
-            let current = processed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if current.is_multiple_of(step) || current == total {
-                progress_cb(current, total);
-            }
-
-            match text_result {
-                Ok(text) => {
-                    let matches = find_matches(&text, &opts.query, opts.ignore_case, opts.context_size);
-                    if !matches.is_empty() {
-                        let display_type = match candidate.ext.as_str() {
-                            "docx" | "docm" | "dotx" | "dotm" => "DOCX".to_string(),
-                            "odt" | "ott" | "ods" | "odp" => "ODT".to_string(),
-                            "fodt" | "fods" => "FODT".to_string(),
-                            "pdf" => "PDF".to_string(),
-                            "txt" | "text" => "TXT".to_string(),
-                            _ => candidate.ext.to_uppercase(),
-                        };
-                        on_match(SearchResult {
-                            file: candidate.path,
-                            file_type: display_type,
-                            matches,
-                            modified: candidate.modified,
-                        });
+                };
+                match raw_res {
+                    Ok(text) => {
+                        let arc_text: Arc<str> = text.into();
+                        cache.insert(cache_key, arc_text.clone());
+                        Ok(arc_text)
                     }
+                    Err(e) => Err(e),
                 }
-                Err(e) => {
-                    on_error(SearchError {
+            }
+        } else {
+            match candidate.ext.as_str() {
+                "fodt" | "fods" => extract_flat_xml(&candidate.path).map(|t| t.into()),
+                "docx" | "docm" | "dotx" | "dotm" => {
+                    extract_docx(&candidate.path).map(|t| t.into())
+                }
+                "odt" | "ott" | "ods" | "odp" => extract_odt(&candidate.path).map(|t| t.into()),
+                "pdf" => extract_pdf(&candidate.path).map(|t| t.into()),
+                "txt" | "text" => extract_plain_text(&candidate.path).map(|t| t.into()),
+                _ => return,
+            }
+        };
+
+        let current = processed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if current.is_multiple_of(step) || current == total {
+            progress_cb(current, total);
+        }
+
+        match text_result {
+            Ok(text) => {
+                let matches = find_matches(&text, &opts.query, opts.ignore_case, opts.context_size);
+                if !matches.is_empty() {
+                    let display_type = match candidate.ext.as_str() {
+                        "docx" | "docm" | "dotx" | "dotm" => "DOCX".to_string(),
+                        "odt" | "ott" | "ods" | "odp" => "ODT".to_string(),
+                        "fodt" | "fods" => "FODT".to_string(),
+                        "pdf" => "PDF".to_string(),
+                        "txt" | "text" => "TXT".to_string(),
+                        _ => candidate.ext.to_uppercase(),
+                    };
+                    on_match(SearchResult {
                         file: candidate.path,
-                        error: e.to_string(),
+                        file_type: display_type,
+                        matches,
+                        modified: candidate.modified,
                     });
                 }
             }
-        });
+            Err(e) => {
+                on_error(SearchError {
+                    file: candidate.path,
+                    error: e.to_string(),
+                });
+            }
+        }
+    });
 
     Ok(SearchStats {
         cached_count: cached_hits.load(std::sync::atomic::Ordering::Relaxed),
@@ -543,8 +561,8 @@ const MAX_PLAIN_TEXT_FILE_SIZE: u64 = 25 * 1024 * 1024; // 25 MB max
 
 /// Extract text from plain text files (.txt, .md, .csv, .log, .json)
 pub fn extract_plain_text(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("Could not read file: {}", path.display()))?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("Could not read file: {}", path.display()))?;
 
     if bytes.len() as u64 > MAX_PLAIN_TEXT_FILE_SIZE {
         return Err(anyhow::anyhow!(
@@ -616,21 +634,25 @@ pub fn extract_docx(path: &Path) -> Result<String> {
         if let Ok(file) = archive.by_index(i) {
             let name = file.name();
             let n = name.replace('\\', "/").to_lowercase();
-            if n.starts_with("word/") && n.ends_with(".xml") && (
-                n == "word/document.xml"
-                || n.starts_with("word/header")
-                || n.starts_with("word/footer")
-                || n.starts_with("word/footnotes")
-                || n.starts_with("word/endnotes")
-                || n.starts_with("word/comments")
-            ) {
+            if n.starts_with("word/")
+                && n.ends_with(".xml")
+                && (n == "word/document.xml"
+                    || n.starts_with("word/header")
+                    || n.starts_with("word/footer")
+                    || n.starts_with("word/footnotes")
+                    || n.starts_with("word/endnotes")
+                    || n.starts_with("word/comments"))
+            {
                 xml_entries.push((i, n));
             }
         }
     }
 
     if xml_entries.is_empty() {
-        return Err(anyhow::anyhow!("word/document.xml missing from docx: {}", path.display()));
+        return Err(anyhow::anyhow!(
+            "word/document.xml missing from docx: {}",
+            path.display()
+        ));
     }
 
     // Ensure word/document.xml comes first
@@ -647,12 +669,16 @@ pub fn extract_docx(path: &Path) -> Result<String> {
 
     let mut full_text = String::with_capacity(4096);
     for (idx, xml_name) in xml_entries {
-        let entry = archive
-            .by_index(idx)
-            .with_context(|| format!("Could not read part {xml_name} in docx: {}", path.display()))?;
+        let entry = archive.by_index(idx).with_context(|| {
+            format!("Could not read part {xml_name} in docx: {}", path.display())
+        })?;
         let reader = Reader::from_reader(std::io::BufReader::new(entry));
-        let part_text = extract_text_from_xml_reader(reader, true)
-            .with_context(|| format!("Error parsing XML in {xml_name} in docx: {}", path.display()))?;
+        let part_text = extract_text_from_xml_reader(reader, true).with_context(|| {
+            format!(
+                "Error parsing XML in {xml_name} in docx: {}",
+                path.display()
+            )
+        })?;
         if !part_text.trim().is_empty() {
             if !full_text.is_empty() && !full_text.ends_with('\n') {
                 full_text.push('\n');
@@ -776,7 +802,9 @@ pub fn extract_text_from_xml_reader<R: std::io::BufRead>(
                                 .attributes()
                                 .filter_map(|a| a.ok())
                                 .find(|a| a.key.local_name().as_ref() == b"c")
-                                .and_then(|a| std::str::from_utf8(&a.value).ok()?.parse::<usize>().ok())
+                                .and_then(|a| {
+                                    std::str::from_utf8(&a.value).ok()?.parse::<usize>().ok()
+                                })
                                 .unwrap_or(1);
                             for _ in 0..count {
                                 text_content.push(' ');
@@ -818,11 +846,14 @@ pub fn extract_text_from_xml(xml: &str) -> Result<String> {
 
 /// Extract text from a .pdf file with header sanitization, panic safety, and fallback stream parsing
 pub fn extract_pdf(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("Could not read file: {}", path.display()))?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("Could not read file: {}", path.display()))?;
 
     if bytes.len() > 100 * 1024 * 1024 {
-        return Err(anyhow::anyhow!("PDF-tiedosto on liian suuri (>100 MB): {}", path.display()));
+        return Err(anyhow::anyhow!(
+            "PDF-tiedosto on liian suuri (>100 MB): {}",
+            path.display()
+        ));
     }
 
     if bytes.is_empty() {
@@ -841,7 +872,9 @@ pub fn extract_pdf(path: &Path) -> Result<String> {
         if let Some(text) = extract_pdf_fallback(&bytes) {
             return Ok(text);
         }
-        return Err(anyhow::anyhow!("Tiedosto ei ole kelvollinen PDF (puuttuva %PDF-otsake)"));
+        return Err(anyhow::anyhow!(
+            "Tiedosto ei ole kelvollinen PDF (puuttuva %PDF-otsake)"
+        ));
     };
 
     // 2. Try standard pdf-extract in-memory directly from the byte slice
@@ -856,7 +889,9 @@ pub fn extract_pdf(path: &Path) -> Result<String> {
             if let Some(text) = extract_pdf_fallback(pdf_bytes) {
                 Ok(text)
             } else {
-                Err(anyhow::anyhow!("PDF-tiedoston tekstirakenne on vioittunut tai suojattu"))
+                Err(anyhow::anyhow!(
+                    "PDF-tiedoston tekstirakenne on vioittunut tai suojattu"
+                ))
             }
         }
     }
@@ -882,13 +917,18 @@ fn extract_pdf_fallback(bytes: &[u8]) -> Option<String> {
                 stream_start += 1;
             }
 
-            if let Some(end_pos) = bytes[stream_start..].windows(9).position(|w| w == b"endstream") {
+            if let Some(end_pos) = bytes[stream_start..]
+                .windows(9)
+                .position(|w| w == b"endstream")
+            {
                 let stream_bytes = &bytes[stream_start..stream_start + end_pos];
 
                 // Try decompressing as zlib/flate reusing pre-allocated buffers
                 zlib_buf.clear();
                 let mut decoder = flate2::read::ZlibDecoder::new(stream_bytes);
-                let decompressed = if decoder.read_to_end(&mut zlib_buf).is_ok() && !zlib_buf.is_empty() {
+                let decompressed = if decoder.read_to_end(&mut zlib_buf).is_ok()
+                    && !zlib_buf.is_empty()
+                {
                     Some(&zlib_buf[..])
                 } else {
                     deflate_buf.clear();
@@ -972,11 +1012,18 @@ fn extract_text_from_pdf_stream(stream: &[u8], out: &mut String) {
         } else if in_hex {
             if b == b'>' {
                 in_hex = false;
-                let hex_clean: Vec<u8> = hex_str.iter().copied().filter(|c| !c.is_ascii_whitespace()).collect();
+                let hex_clean: Vec<u8> = hex_str
+                    .iter()
+                    .copied()
+                    .filter(|c| !c.is_ascii_whitespace())
+                    .collect();
                 let mut decoded = Vec::with_capacity(hex_clean.len() / 2);
                 let mut chunk = hex_clean.chunks_exact(2);
                 for pair in &mut chunk {
-                    if let (Ok(h1), Ok(h2)) = (std::str::from_utf8(&pair[0..1]), std::str::from_utf8(&pair[1..2])) {
+                    if let (Ok(h1), Ok(h2)) = (
+                        std::str::from_utf8(&pair[0..1]),
+                        std::str::from_utf8(&pair[1..2]),
+                    ) {
                         if let Ok(val) = u8::from_str_radix(&format!("{}{}", h1, h2), 16) {
                             if val >= 32 || val == b'\n' || val == b'\r' || val == b'\t' {
                                 decoded.push(val);
@@ -1131,11 +1178,7 @@ pub fn starts_with_exact(text_slice: &str, query: &str) -> Option<usize> {
 
 pub const MAX_MATCHES_PER_FILE: usize = 200;
 
-pub fn find_match_spans(
-    text: &str,
-    query: &str,
-    ignore_case: bool,
-) -> Vec<(usize, usize)> {
+pub fn find_match_spans(text: &str, query: &str, ignore_case: bool) -> Vec<(usize, usize)> {
     find_match_spans_limit(text, query, ignore_case, None)
 }
 
@@ -1190,13 +1233,14 @@ pub fn find_match_spans_limit(
     spans
 }
 
-pub fn find_matches(
-    text: &str,
-    query: &str,
-    ignore_case: bool,
-    context_size: usize,
-) -> Vec<Match> {
-    find_matches_limit(text, query, ignore_case, context_size, Some(MAX_MATCHES_PER_FILE))
+pub fn find_matches(text: &str, query: &str, ignore_case: bool, context_size: usize) -> Vec<Match> {
+    find_matches_limit(
+        text,
+        query,
+        ignore_case,
+        context_size,
+        Some(MAX_MATCHES_PER_FILE),
+    )
 }
 
 pub fn find_matches_limit(
@@ -1324,7 +1368,8 @@ mod tests {
         let xml = "<w:document><w:body><w:p><w:r><w:t>Streaming XML Test</w:t></w:r></w:p></w:body></w:document>";
         let cursor = std::io::Cursor::new(xml.as_bytes());
         let reader = Reader::from_reader(cursor);
-        let extracted = extract_text_from_xml_reader(reader, true).expect("Streaming XML extraction failed");
+        let extracted =
+            extract_text_from_xml_reader(reader, true).expect("Streaming XML extraction failed");
         assert_eq!(extracted, "Streaming XML Test\n");
     }
 
@@ -1345,7 +1390,11 @@ mod tests {
     fn test_extract_plain_text_from_tempfile() {
         let temp_dir = std::env::temp_dir();
         let test_file = temp_dir.join("doxsearch_test_plain.txt");
-        std::fs::write(&test_file, "Tämä on puhdasta tekstiä testiin.\nToinen rivi.").expect("write failed");
+        std::fs::write(
+            &test_file,
+            "Tämä on puhdasta tekstiä testiin.\nToinen rivi.",
+        )
+        .expect("write failed");
 
         let extracted = extract_plain_text(&test_file).expect("extract failed");
         assert!(extracted.contains("puhdasta tekstiä"));
@@ -1470,8 +1519,7 @@ mod tests {
         // ISO-8859-1 encoded string: "Sähköposti ja Päivämäärä"
         // 'ä' = 0xE4, 'ö' = 0xF6, 'ä' = 0xE4, 'ä' = 0xE4
         let latin1_bytes: Vec<u8> = vec![
-            b'S', 0xE4, b'h', b'k', 0xF6, b'p', b'o', b's', b't', b'i', b' ',
-            b'j', b'a', b' ',
+            b'S', 0xE4, b'h', b'k', 0xF6, b'p', b'o', b's', b't', b'i', b' ', b'j', b'a', b' ',
             b'P', 0xE4, b'i', b'v', 0xE4, b'm', 0xE4, 0xE4, b'r', 0xE4,
         ];
         std::fs::write(&test_file, &latin1_bytes).expect("write failed");
@@ -1562,7 +1610,10 @@ mod tests {
         std::fs::write(&bin_file, &binary_data).expect("write failed");
 
         let result = extract_plain_text(&bin_file);
-        assert!(result.is_err(), "Binary file containing null bytes must be rejected");
+        assert!(
+            result.is_err(),
+            "Binary file containing null bytes must be rejected"
+        );
 
         let _ = std::fs::remove_file(bin_file);
     }
@@ -1586,7 +1637,8 @@ mod tests {
 
     #[test]
     fn test_xml_malformed_returns_error() {
-        let malformed_xml = "<w:document><w:body><w:p><w:t>Hello</w:wrong></w:p></w:body></w:document>";
+        let malformed_xml =
+            "<w:document><w:body><w:p><w:t>Hello</w:wrong></w:p></w:body></w:document>";
         let res = extract_text_from_xml(malformed_xml);
         assert!(res.is_err(), "Malformed XML should return an error");
     }
@@ -1600,7 +1652,8 @@ mod tests {
 
     #[test]
     fn test_multi_format_directory_search_finds_all_types() {
-        let temp_dir = std::env::temp_dir().join(format!("doxsearch_multi_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("doxsearch_multi_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&temp_dir);
 
         // 1. Plain text file (.txt)
@@ -1654,10 +1707,15 @@ mod tests {
             },
             |_| {},
             |_, _| {},
-        ).unwrap();
+        )
+        .unwrap();
 
         let results = matches_found.lock().unwrap();
-        assert_eq!(results.len(), 4, "Should only find 4 supported files (2 TXT, 1 FODT, 1 PDF), ignoring .json and .md");
+        assert_eq!(
+            results.len(),
+            4,
+            "Should only find 4 supported files (2 TXT, 1 FODT, 1 PDF), ignoring .json and .md"
+        );
         let types: Vec<String> = results.iter().map(|r| r.file_type.clone()).collect();
         assert_eq!(types.iter().filter(|t| *t == "TXT").count(), 2);
         assert!(types.contains(&"PDF".to_string()));
@@ -1669,7 +1727,8 @@ mod tests {
 
     #[test]
     fn test_repeated_search_with_changing_file_type_options() {
-        let temp_dir = std::env::temp_dir().join(format!("doxsearch_repeat_opts_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("doxsearch_repeat_opts_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&temp_dir);
 
         let txt_path = temp_dir.join("sample.txt");
@@ -1693,7 +1752,15 @@ mod tests {
         };
         let matches1 = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let m1 = matches1.clone();
-        let _ = search_directory(&opts1, &cache, None, move |r| m1.lock().unwrap().push(r), |_| {}, |_, _| {}).unwrap();
+        let _ = search_directory(
+            &opts1,
+            &cache,
+            None,
+            move |r| m1.lock().unwrap().push(r),
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap();
         assert_eq!(matches1.lock().unwrap().len(), 1);
         assert_eq!(matches1.lock().unwrap()[0].file_type, "TXT");
 
@@ -1709,7 +1776,15 @@ mod tests {
         };
         let matches2 = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let m2 = matches2.clone();
-        let _ = search_directory(&opts2, &cache, None, move |r| m2.lock().unwrap().push(r), |_| {}, |_, _| {}).unwrap();
+        let _ = search_directory(
+            &opts2,
+            &cache,
+            None,
+            move |r| m2.lock().unwrap().push(r),
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap();
         assert_eq!(matches2.lock().unwrap().len(), 1);
         assert_eq!(matches2.lock().unwrap()[0].file_type, "PDF");
 
@@ -1725,7 +1800,15 @@ mod tests {
         };
         let matches3 = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let m3 = matches3.clone();
-        let _ = search_directory(&opts3, &cache, None, move |r| m3.lock().unwrap().push(r), |_| {}, |_, _| {}).unwrap();
+        let _ = search_directory(
+            &opts3,
+            &cache,
+            None,
+            move |r| m3.lock().unwrap().push(r),
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap();
         assert_eq!(matches3.lock().unwrap().len(), 2);
 
         let _ = std::fs::remove_dir_all(temp_dir);
@@ -1733,7 +1816,8 @@ mod tests {
 
     #[test]
     fn test_extract_flat_xml_fodt() {
-        let temp_dir = std::env::temp_dir().join(format!("doxsearch_fodt_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("doxsearch_fodt_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&temp_dir);
         let fodt_path = temp_dir.join("sample.fodt");
         let xml_content = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1762,7 +1846,11 @@ mod tests {
 
         // Search with multiple spaces in query
         let matches2 = find_matches(text, "useita       välejä", true, 30);
-        assert_eq!(matches2.len(), 1, "Should match multiple spaces in query to multiple spaces in text");
+        assert_eq!(
+            matches2.len(),
+            1,
+            "Should match multiple spaces in query to multiple spaces in text"
+        );
 
         // Exact case search
         let matches3 = find_matches(text, "tärkeä asiakirja", false, 30);
@@ -1771,7 +1859,7 @@ mod tests {
 
     #[test]
     fn test_docx_sort_by_strict_weak_ordering() {
-        let mut names = vec![
+        let mut names = [
             "word/document.xml".to_string(),
             "word/document.xml".to_string(),
             "word/header1.xml".to_string(),
@@ -1795,7 +1883,8 @@ mod tests {
 
     #[test]
     fn test_date_filter_excludes_none_and_respects_after() {
-        let temp_dir = std::env::temp_dir().join(format!("doxsearch_date_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("doxsearch_date_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&temp_dir);
 
         let file1 = temp_dir.join("recent.txt");
@@ -1815,7 +1904,15 @@ mod tests {
 
         let matches_found = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let m_clone = matches_found.clone();
-        let _ = search_directory(&opts, &cache, None, move |r| m_clone.lock().unwrap().push(r), |_| {}, |_, _| {}).unwrap();
+        let _ = search_directory(
+            &opts,
+            &cache,
+            None,
+            move |r| m_clone.lock().unwrap().push(r),
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap();
 
         assert_eq!(matches_found.lock().unwrap().len(), 0);
 
@@ -1824,7 +1921,8 @@ mod tests {
 
     #[test]
     fn test_directory_change_searches_all_supported_types() {
-        let base_dir = std::env::temp_dir().join(format!("doxsearch_dir_switch_{}", std::process::id()));
+        let base_dir =
+            std::env::temp_dir().join(format!("doxsearch_dir_switch_{}", std::process::id()));
         let dir_a = base_dir.join("folder_a");
         let dir_b = base_dir.join("folder_b");
         let _ = std::fs::create_dir_all(&dir_a);
@@ -1869,7 +1967,15 @@ mod tests {
 
         let matches_a = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let m_a = matches_a.clone();
-        let stats_a = search_directory(&opts, &cache, None, move |r| m_a.lock().unwrap().push(r), |_| {}, |_, _| {}).unwrap();
+        let stats_a = search_directory(
+            &opts,
+            &cache,
+            None,
+            move |r| m_a.lock().unwrap().push(r),
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap();
 
         let results_a = matches_a.lock().unwrap();
         assert_eq!(results_a.len(), 2, "Dir A should find both PDF and TXT");
@@ -1887,7 +1993,8 @@ mod tests {
             move |r| m_b.lock().unwrap().push(r),
             |_| {},
             |_, _| {},
-        ).unwrap();
+        )
+        .unwrap();
 
         let results_b = matches_b.lock().unwrap();
         assert_eq!(results_b.len(), 3, "Dir B should find PDF, TXT, and FODT");
@@ -1902,11 +2009,15 @@ mod tests {
 
     #[test]
     fn test_non_txt_files_are_strictly_ignored() {
-        let temp_dir = std::env::temp_dir().join(format!("doxsearch_strict_txt_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("doxsearch_strict_txt_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&temp_dir);
 
         // Files that should NOT be matched:
-        let extensions = ["json", "toml", "yaml", "yml", "xml", "html", "htm", "csv", "tsv", "log", "md", "markdown", "ini", "conf", "cfg", "rst", "rs", "py", "sh"];
+        let extensions = [
+            "json", "toml", "yaml", "yml", "xml", "html", "htm", "csv", "tsv", "log", "md",
+            "markdown", "ini", "conf", "cfg", "rst", "rs", "py", "sh",
+        ];
         for ext in &extensions {
             let p = temp_dir.join(format!("file.{}", ext));
             std::fs::write(&p, "salasana123").unwrap();
@@ -1936,10 +2047,15 @@ mod tests {
             move |r| m_clone.lock().unwrap().push(r),
             |_| {},
             |_, _| {},
-        ).unwrap();
+        )
+        .unwrap();
 
         let results = matches_found.lock().unwrap();
-        assert_eq!(results.len(), 1, "Only actual_doc.txt should match, all other extensions must be ignored");
+        assert_eq!(
+            results.len(),
+            1,
+            "Only actual_doc.txt should match, all other extensions must be ignored"
+        );
         assert_eq!(results[0].file_type, "TXT");
         assert_eq!(stats.total_count, 1);
 
@@ -1966,7 +2082,7 @@ mod tests {
                     let text: Arc<str> = format!("Tämä on säikeen {} dokumentti {}", t, i).into();
                     cache_clone.insert(key.clone(), text.clone());
                     let retrieved = cache_clone.get(&key);
-                    assert!(retrieved.is_some() || cache_clone.len() > 0);
+                    assert!(retrieved.is_some() || !cache_clone.is_empty());
                 }
             });
             handles.push(handle);
@@ -1976,19 +2092,24 @@ mod tests {
             h.join().unwrap();
         }
 
-        assert!(cache.len() > 0);
+        assert!(!cache.is_empty());
         assert!(cache.memory_usage_bytes() > 0);
         assert!(cache.memory_usage_bytes() <= MAX_CACHE_TOTAL_BYTES);
     }
 
     #[test]
     fn test_repeated_search_multi_file_directory_never_wipes_cache() {
-        let temp_dir = std::env::temp_dir().join(format!("doxsearch_multi_cache_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("doxsearch_multi_cache_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&temp_dir);
 
         for i in 0..60 {
             let p = temp_dir.join(format!("file_{}.txt", i));
-            std::fs::write(&p, format!("Dokumentti {} sisältää hakusanan ja uniikkia tekstiä", i)).unwrap();
+            std::fs::write(
+                &p,
+                format!("Dokumentti {} sisältää hakusanan ja uniikkia tekstiä", i),
+            )
+            .unwrap();
         }
 
         let cache = DocumentCache::new();
@@ -2014,7 +2135,10 @@ mod tests {
         };
         let stats2 = search_directory(&opts2, &cache, None, |_| {}, |_| {}, |_, _| {}).unwrap();
         assert_eq!(stats2.total_count, 60);
-        assert_eq!(stats2.cached_count, 60, "All 60 files must be served directly from cache");
+        assert_eq!(
+            stats2.cached_count, 60,
+            "All 60 files must be served directly from cache"
+        );
         assert_eq!(cache.len(), 60, "Cache must not be wiped or pruned");
 
         // Third search with third query: still 100% cache hits!
