@@ -6,7 +6,6 @@ use egui::{Color32, FontId, RichText, Vec2};
 use search::{DocumentCache, SearchError, SearchOptions, SearchResult, SearchStats};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::OnceLock;
 use std::thread;
 
@@ -44,6 +43,7 @@ enum SearchMessage {
         search_id: usize,
         message: String,
     },
+    UiError(String),
 }
 
 use chrono::{DateTime, Local};
@@ -405,6 +405,59 @@ pub fn save_file_dialog(default_name: &str, filter_ext: &str) -> Option<PathBuf>
         .save_file()
 }
 
+#[cfg(target_os = "linux")]
+fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> Result<(), String> {
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    let uri_str = uri.to_string();
+
+    let spawn_res = thread::Builder::new()
+        .name("dbus-fm-call".to_string())
+        .spawn(move || {
+            let conn = match zbus::blocking::Connection::session() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = done_tx.send(Err(format!("D-Bus session connect error: {e}")));
+                    return;
+                }
+            };
+
+            let methods = if is_dir {
+                ["ShowFolders", "ShowItems"]
+            } else {
+                ["ShowItems", "ShowFolders"]
+            };
+
+            for method in methods {
+                let uris = [uri_str.as_str()];
+                if conn
+                    .call_method(
+                        Some("org.freedesktop.FileManager1"),
+                        "/org/freedesktop/FileManager1",
+                        Some("org.freedesktop.FileManager1"),
+                        method,
+                        &(uris.as_slice(), ""),
+                    )
+                    .is_ok()
+                {
+                    let _ = done_tx.send(Ok(()));
+                    return;
+                }
+            }
+
+            let _ = done_tx.send(Err("D-Bus FileManager1 call failed".to_string()));
+        });
+
+    if spawn_res.is_err() {
+        return Err("Failed to spawn D-Bus thread".to_string());
+    }
+
+    match done_rx.recv_timeout(std::time::Duration::from_millis(1500)) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("D-Bus FileManager1 timed out".to_string()),
+    }
+}
+
 pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
     if !path.exists() {
         return Err(format!("Path does not exist: {}", path.display()));
@@ -446,61 +499,14 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
         let uri = path_to_file_uri(&canonical);
         let is_dir = canonical.is_dir();
 
-        // 1. Ensisijainen: Kevyt D-Bus IPC (org.freedesktop.FileManager1) ilman uuden prosessin luontia.
-        // Pyytää taustalla jo käynnissä olevaa tiedostonhallintaa (Dolphin, Nautilus, Nemo, Thunar jne.)
-        // avaamaan tai korostamaan polun suoraan istuntoväylän (session bus) kautta.
-        if let Ok(conn) = zbus::blocking::Connection::session() {
-            let methods = if is_dir {
-                ["ShowFolders", "ShowItems"]
-            } else {
-                ["ShowItems", "ShowFolders"]
-            };
-
-            for method in methods {
-                let uris = [uri.as_str()];
-                if conn
-                    .call_method(
-                        Some("org.freedesktop.FileManager1"),
-                        "/org/freedesktop/FileManager1",
-                        Some("org.freedesktop.FileManager1"),
-                        method,
-                        &(uris.as_slice(), ""),
-                    )
-                    .is_ok()
-                {
-                    return Ok(());
-                }
-            }
+        // 1. Ensisijainen: Kevyt D-Bus IPC (org.freedesktop.FileManager1) zbus-kirjaston kautta.
+        // Ei luo uutta prosessia (kuten dbus-send tai dolphin) ja käyttää erillistä säiettä
+        // sekä 1.5 sekunnin aikakatkaisua (timeout), jotta UI ei voi koskaan jäätyä.
+        if show_in_file_manager_dbus(&uri, is_dir).is_ok() {
+            return Ok(());
         }
 
-        // 2. Toissijainen IPC-varatapa: dbus-send komentorivityökalulla
-        let dbus_methods = if is_dir {
-            ["ShowFolders", "ShowItems"]
-        } else {
-            ["ShowItems", "ShowFolders"]
-        };
-
-        for method in dbus_methods {
-            if let Ok(status) = std::process::Command::new("dbus-send")
-                .args([
-                    "--session",
-                    "--dest=org.freedesktop.FileManager1",
-                    "--type=method_call",
-                    "/org/freedesktop/FileManager1",
-                    &format!("org.freedesktop.FileManager1.{}", method),
-                    &format!("array:string:{}", uri),
-                    "string:",
-                ])
-                .stderr(Stdio::null())
-                .status()
-            {
-                if status.success() {
-                    return Ok(());
-                }
-            }
-        }
-
-        // 3. Viimeinen varajärjestelmä: Avaa kansion oletuskäsittelijällä (xdg-open via open::that)
+        // 2. Varatapa: Avaa kansio järjestelmän oletuskäsittelijällä (xdg-open via open::that)
         let target = if is_dir {
             &canonical
         } else {
@@ -882,6 +888,10 @@ impl DoXsearchApp {
                         self.state = SearchState::Idle;
                     }
                 }
+                SearchMessage::UiError(message) => {
+                    self.error = Some(message);
+                    self.status_info = None;
+                }
             }
         }
         if new_matches && self.results.len() <= 200 {
@@ -900,6 +910,32 @@ impl DoXsearchApp {
         if got_msg {
             ctx.request_repaint();
         }
+    }
+
+    fn open_in_file_manager_async(&self, path: &Path) {
+        let path = path.to_path_buf();
+        let tx = self.tx.clone();
+        thread::Builder::new()
+            .name("show-in-fm".to_string())
+            .spawn(move || {
+                if let Err(e) = show_in_file_manager(&path) {
+                    let _ = tx.send(SearchMessage::UiError(e));
+                }
+            })
+            .ok();
+    }
+
+    fn open_file_async(&self, path: &Path) {
+        let path = path.to_path_buf();
+        let tx = self.tx.clone();
+        thread::Builder::new()
+            .name("open-file".to_string())
+            .spawn(move || {
+                if let Err(e) = open::that(&path) {
+                    let _ = tx.send(SearchMessage::UiError(format!("Failed to open file: {e}")));
+                }
+            })
+            .ok();
     }
 
     fn total_matches(&self) -> usize {
@@ -1174,10 +1210,10 @@ impl eframe::App for DoXsearchApp {
                             });
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
-                                ftbtn(ui, &mut self.opts.search_docx, "DOCX", BLUE_MED);
-                                ftbtn(ui, &mut self.opts.search_odt,  "ODT",  GREEN);
-                                ftbtn(ui, &mut self.opts.search_pdf,  "PDF",  ORANGE);
-                                ftbtn(ui, &mut self.opts.search_txt,  "TXT",  PURPLE);
+                                ftbtn(ui, &mut self.opts.search_docx, "DOCX", file_type_color("DOCX"));
+                                ftbtn(ui, &mut self.opts.search_odt,  "ODT",  file_type_color("ODT"));
+                                ftbtn(ui, &mut self.opts.search_pdf,  "PDF",  file_type_color("PDF"));
+                                ftbtn(ui, &mut self.opts.search_txt,  "TXT",  file_type_color("TXT"));
                             });
                             ui.add_space(6.0);
 
@@ -1345,7 +1381,6 @@ impl eframe::App for DoXsearchApp {
         // File list panel (center)
         if !self.results.is_empty() {
             let mut new_sel = self.selected_result;
-            let mut open_path: Option<PathBuf> = None;
 
             egui::SidePanel::left("file_list_panel")
                 .exact_width(280.0)
@@ -1374,28 +1409,20 @@ impl eframe::App for DoXsearchApp {
                                         .font(FontId::proportional(11.0)),
                                 )
                                 .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut self.sort_order,
+                                    for &order in &[
                                         SortOrder::DateDesc,
-                                        SortOrder::DateDesc.label(self.lang),
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.sort_order,
                                         SortOrder::DateAsc,
-                                        SortOrder::DateAsc.label(self.lang),
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.sort_order,
                                         SortOrder::Name,
-                                        SortOrder::Name.label(self.lang),
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.sort_order,
                                         SortOrder::Matches,
-                                        SortOrder::Matches.label(self.lang),
-                                    );
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut self.sort_order,
+                                            order,
+                                            order.label(self.lang),
+                                        );
+                                    }
                                 });
-                            if prev_sort != self.sort_order {
+                            if self.sort_order != prev_sort {
                                 self.sort_results();
                             }
                         });
@@ -1404,29 +1431,23 @@ impl eframe::App for DoXsearchApp {
                     ui.separator();
 
                     egui::ScrollArea::vertical()
-                        .id_source("file_list")
+                        .id_source("file_list_scroll")
                         .show_rows(ui, 88.0, self.results.len(), |ui, row_range| {
                             for ri in row_range {
                                 let result = &self.results[ri];
-                                let is_sel = new_sel == Some(ri);
+                                let is_sel = self.selected_result == Some(ri);
                                 let fname = result
                                     .file
                                     .file_name()
                                     .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .to_string();
+                                    .to_string_lossy();
                                 let fdir = result
                                     .file
                                     .parent()
-                                    .map(|p| truncate_path(&p.to_string_lossy(), 26))
+                                    .map(|p| truncate_path(&p.to_string_lossy(), 24))
                                     .unwrap_or_default();
-                                let type_color = match result.file_type.as_str() {
-                                    "DOCX" => BLUE_MED,
-                                    "ODT" | "FODT" => GREEN,
-                                    "PDF" => ORANGE,
-                                    "TXT" => PURPLE,
-                                    _ => TEXT_MED,
-                                };
+
+                                let type_color = file_type_color(&result.file_type);
 
                                 let date_str = result
                                     .modified
@@ -1472,25 +1493,17 @@ impl eframe::App for DoXsearchApp {
                                         ui.label(
                                             RichText::new("•")
                                                 .font(FontId::monospace(10.0))
-                                                .color(TEXT_MED),
+                                                .color(GRAY_BORDER),
                                         );
                                     }
-                                    let matches_count_label = if self.lang == AppLanguage::Finnish {
-                                        if result.matches.len() >= search::MAX_MATCHES_PER_FILE {
-                                            format!("{}+ osumaa", search::MAX_MATCHES_PER_FILE)
-                                        } else {
-                                            format!("{} osumaa", result.matches.len())
-                                        }
+                                    let matches_count = if self.lang == AppLanguage::Finnish {
+                                        format!("{} osumaa", result.matches.len())
                                     } else {
-                                        if result.matches.len() >= search::MAX_MATCHES_PER_FILE {
-                                            format!("{}+ matches", search::MAX_MATCHES_PER_FILE)
-                                        } else {
-                                            format!("{} matches", result.matches.len())
-                                        }
+                                        format!("{} matches", result.matches.len())
                                     };
                                     ui.label(
-                                        RichText::new(matches_count_label)
-                                            .font(FontId::proportional(10.0))
+                                        RichText::new(matches_count)
+                                            .font(FontId::monospace(10.0))
                                             .color(TEXT_MED),
                                     );
                                 });
@@ -1515,7 +1528,7 @@ impl eframe::App for DoXsearchApp {
                                         .small_button(RichText::new(open_btn_label).color(BLUE_MED))
                                         .clicked()
                                     {
-                                        open_path = Some(result.file.clone());
+                                        self.open_file_async(&result.file);
                                     }
                                     let fm_tooltip = if self.lang == AppLanguage::Finnish {
                                         format!("Näytä: {}", os_file_manager_name(self.lang))
@@ -1529,10 +1542,7 @@ impl eframe::App for DoXsearchApp {
                                         .on_hover_text(fm_tooltip)
                                         .clicked()
                                     {
-                                        if let Err(e) = show_in_file_manager(&result.file) {
-                                            self.error = Some(e);
-                                            self.status_info = None;
-                                        }
+                                        self.open_in_file_manager_async(&result.file);
                                     }
                                     if ui
                                         .small_button(
@@ -1554,12 +1564,6 @@ impl eframe::App for DoXsearchApp {
                 });
 
             self.selected_result = new_sel;
-            if let Some(path) = open_path {
-                if let Err(e) = open::that(&path) {
-                    self.error = Some(format!("Failed to open: {}", e));
-                    self.status_info = None;
-                }
-            }
         }
 
         // Right panel: matches
@@ -1615,10 +1619,7 @@ impl eframe::App for DoXsearchApp {
                 if ui.button(
                     RichText::new(open_file_text).color(Color32::WHITE)
                 ).clicked() {
-                    if let Err(e) = open::that(&result.file) {
-                        self.error = Some(format!("Failed to open file: {}", e));
-                        self.status_info = None;
-                    }
+                    self.open_file_async(&result.file);
                 }
                 let show_fm_text = if self.lang == AppLanguage::Finnish {
                     format!("Näytä: {}", os_file_manager_name(self.lang))
@@ -1628,10 +1629,7 @@ impl eframe::App for DoXsearchApp {
                 if ui.button(
                     RichText::new(show_fm_text).color(TEXT_DARK)
                 ).clicked() {
-                    if let Err(e) = show_in_file_manager(&result.file) {
-                        self.error = Some(e);
-                        self.status_info = None;
-                    }
+                    self.open_in_file_manager_async(&result.file);
                 }
                 let copy_path_text = if self.lang == AppLanguage::Finnish { "Kopioi polku" } else { "Copy Path" };
                 if ui.button(
@@ -1688,6 +1686,16 @@ impl eframe::App for DoXsearchApp {
                     }
                 });
         });
+    }
+}
+
+pub fn file_type_color(file_type: &str) -> Color32 {
+    match file_type {
+        "DOCX" => BLUE_MED,
+        "ODT" | "FODT" => GREEN,
+        "PDF" => ORANGE,
+        "TXT" => PURPLE,
+        _ => TEXT_MED,
     }
 }
 
@@ -2031,5 +2039,15 @@ mod tests {
         let result = show_in_file_manager(non_existent);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("does not exist"));
+    }
+
+    #[test]
+    fn test_file_type_color_matches_filter_buttons() {
+        assert_eq!(file_type_color("DOCX"), BLUE_MED);
+        assert_eq!(file_type_color("ODT"), GREEN);
+        assert_eq!(file_type_color("FODT"), GREEN);
+        assert_eq!(file_type_color("PDF"), ORANGE);
+        assert_eq!(file_type_color("TXT"), PURPLE);
+        assert_eq!(file_type_color("UNKNOWN"), TEXT_MED);
     }
 }
