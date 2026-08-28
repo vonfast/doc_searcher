@@ -416,7 +416,7 @@ fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> Result<(), String> {
             let conn = match zbus::blocking::Connection::session() {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = done_tx.send(Err(format!("D-Bus session connect error: {e}")));
+                    let _ = done_tx.send(Err(format!("D-Bus session bus connection failed: {e}")));
                     return;
                 }
             };
@@ -427,34 +427,44 @@ fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> Result<(), String> {
                 ["ShowItems", "ShowFolders"]
             };
 
+            let mut method_errors = Vec::new();
+
             for method in methods {
                 let uris = [uri_str.as_str()];
-                if conn
-                    .call_method(
-                        Some("org.freedesktop.FileManager1"),
-                        "/org/freedesktop/FileManager1",
-                        Some("org.freedesktop.FileManager1"),
-                        method,
-                        &(uris.as_slice(), ""),
-                    )
-                    .is_ok()
-                {
-                    let _ = done_tx.send(Ok(()));
-                    return;
+                match conn.call_method(
+                    Some("org.freedesktop.FileManager1"),
+                    "/org/freedesktop/FileManager1",
+                    Some("org.freedesktop.FileManager1"),
+                    method,
+                    &(uris.as_slice(), ""),
+                ) {
+                    Ok(_) => {
+                        let _ = done_tx.send(Ok(()));
+                        return;
+                    }
+                    Err(e) => {
+                        method_errors.push(format!("{method}: {e}"));
+                    }
                 }
             }
 
-            let _ = done_tx.send(Err("D-Bus FileManager1 call failed".to_string()));
+            let error_summary = method_errors.join("; ");
+            let _ = done_tx.send(Err(format!("FileManager1 method calls failed: {error_summary}")));
         });
 
-    if spawn_res.is_err() {
-        return Err("Failed to spawn D-Bus thread".to_string());
+    if let Err(e) = spawn_res {
+        return Err(format!("Failed to spawn D-Bus thread: {e}"));
     }
 
     match done_rx.recv_timeout(std::time::Duration::from_millis(1500)) {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e),
-        Err(_) => Err("D-Bus FileManager1 timed out".to_string()),
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            Err("D-Bus FileManager1 call timed out (1500 ms)".to_string())
+        }
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            Err("D-Bus thread disconnected unexpectedly".to_string())
+        }
     }
 }
 
@@ -500,19 +510,22 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
         let is_dir = canonical.is_dir();
 
         // 1. Ensisijainen: Kevyt D-Bus IPC (org.freedesktop.FileManager1) zbus-kirjaston kautta.
-        // Ei luo uutta prosessia (kuten dbus-send tai dolphin) ja käyttää erillistä säiettä
-        // sekä 1.5 sekunnin aikakatkaisua (timeout), jotta UI ei voi koskaan jäätyä.
-        if show_in_file_manager_dbus(&uri, is_dir).is_ok() {
-            return Ok(());
+        // Ei luo uutta prosessia ja käyttää erillistä säiettä sekä 1.5 sekunnin aikakatkaisua.
+        match show_in_file_manager_dbus(&uri, is_dir) {
+            Ok(()) => Ok(()),
+            Err(dbus_err) => {
+                eprintln!("[DoXsearch] D-Bus FileManager1 failed: {dbus_err}. Falling back to default handler...");
+                // 2. Varatapa: Avaa kansio järjestelmän oletuskäsittelijällä (xdg-open via open::that)
+                let target = if is_dir {
+                    &canonical
+                } else {
+                    canonical.parent().unwrap_or(&canonical)
+                };
+                open::that(target).map_err(|fallback_err| {
+                    format!("Failed to open in file manager: {fallback_err} (D-Bus IPC failed: {dbus_err})")
+                })
+            }
         }
-
-        // 2. Varatapa: Avaa kansio järjestelmän oletuskäsittelijällä (xdg-open via open::that)
-        let target = if is_dir {
-            &canonical
-        } else {
-            canonical.parent().unwrap_or(&canonical)
-        };
-        open::that(target).map_err(|e| format!("Failed to open folder: {e}"))
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
