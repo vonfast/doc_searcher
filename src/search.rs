@@ -2867,7 +2867,7 @@ mod tests {
             use_cache: true,
             ..Default::default()
         };
-        let _ = search_directory(
+        let stats_old = search_directory(
             &opts_old,
             &cache,
             None,
@@ -2876,6 +2876,7 @@ mod tests {
             |_, _| {},
         )
         .unwrap();
+        assert_eq!(stats_old.total_count, 1, "Deleted file must not be counted in total_count");
         assert_eq!(
             hits.lock().unwrap().len(),
             0,
@@ -2891,7 +2892,7 @@ mod tests {
             use_cache: true,
             ..Default::default()
         };
-        let _ = search_directory(
+        let stats_del = search_directory(
             &opts_del,
             &cache,
             None,
@@ -2900,6 +2901,7 @@ mod tests {
             |_, _| {},
         )
         .unwrap();
+        assert_eq!(stats_del.total_count, 1, "Deleted file must not be counted in total_count");
         assert_eq!(
             hits.lock().unwrap().len(),
             0,
@@ -2915,7 +2917,7 @@ mod tests {
             use_cache: true,
             ..Default::default()
         };
-        let _ = search_directory(
+        let stats_new = search_directory(
             &opts_new,
             &cache,
             None,
@@ -2924,6 +2926,7 @@ mod tests {
             |_, _| {},
         )
         .unwrap();
+        assert_eq!(stats_new.total_count, 1, "Deleted file must not be counted in total_count");
         assert_eq!(
             hits.lock().unwrap().len(),
             1,
