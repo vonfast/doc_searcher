@@ -21,10 +21,13 @@ pub struct HeavyTaskPermit<'a> {
 
 impl<'a> Drop for HeavyTaskPermit<'a> {
     fn drop(&mut self) {
-        if let Ok(mut count) = self.semaphore.permits.lock() {
-            *count += 1;
-            self.semaphore.cvar.notify_one();
-        }
+        let mut count = self
+            .semaphore
+            .permits
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *count += 1;
+        self.semaphore.cvar.notify_one();
     }
 }
 
@@ -50,7 +53,10 @@ impl HeavyTaskSemaphore {
         &self,
         is_cancelled: Option<&std::sync::atomic::AtomicBool>,
     ) -> Option<HeavyTaskPermit<'_>> {
-        let mut count = self.permits.lock().ok()?;
+        let mut count = self
+            .permits
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         loop {
             if let Some(cancel) = is_cancelled {
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -71,7 +77,11 @@ impl HeavyTaskSemaphore {
 
     #[allow(dead_code)]
     pub fn available_permits(&self) -> usize {
-        self.permits.lock().map(|g| *g).unwrap_or(0)
+        *self
+            .permits
+            .lock()
+            .map(|g| g)
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 }
 
@@ -2505,6 +2515,33 @@ mod tests {
         assert!(
             cancelled_permit.is_none(),
             "Cancelled request must abort and return None immediately"
+        );
+    }
+
+    #[test]
+    fn test_heavy_task_semaphore_recovers_from_poisoned_mutex() {
+        let semaphore = HeavyTaskSemaphore::new(1);
+        let permit = semaphore
+            .acquire_cancellable(None)
+            .expect("first permit should be acquired");
+
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = semaphore.permits.lock().unwrap();
+            panic!("poison the mutex");
+        });
+        assert!(poisoned.is_err(), "locking and panicking should poison the mutex");
+
+        drop(permit);
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "permit release must recover from poison and restore count"
+        );
+
+        let reacquired = semaphore.acquire_cancellable(None);
+        assert!(
+            reacquired.is_some(),
+            "a poisoned mutex should still allow a permit to be reacquired"
         );
     }
 
