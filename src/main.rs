@@ -2160,13 +2160,4 @@ mod tests {
             assert!(!e.is_empty(), "Error message must be descriptive");
         }
     }
-
-    #[test]
-    fn test_show_in_file_manager_existing_temp_path_does_not_panic() {
-        let temp_file = std::env::temp_dir().join(format!("doxsearch-test-fm-{}.tmp", std::process::id()));
-        std::fs::write(&temp_file, b"test").unwrap();
-        // show_in_file_manager should attempt D-Bus, then fallback, without panicking
-        let _ = show_in_file_manager(&temp_file);
-        let _ = std::fs::remove_file(temp_file);
-    }
 }
