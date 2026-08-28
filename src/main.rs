@@ -446,6 +446,28 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+        // 1. Try DBus org.freedesktop.FileManager1.ShowItems (fast IPC to active file manager)
+        let uri = path_to_file_uri(&canonical);
+        let dbus_result = std::process::Command::new("dbus-send")
+            .args([
+                "--session",
+                "--dest=org.freedesktop.FileManager1",
+                "--type=method_call",
+                "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1.ShowItems",
+                &format!("array:string:{}", uri),
+                "string:",
+            ])
+            .status();
+
+        if let Ok(status) = dbus_result {
+            if status.success() {
+                return Ok(());
+            }
+        }
+
+        // 2. Direct invocation based on detected file manager (fallback if DBus fails or is unavailable)
         let fm = detect_linux_file_manager();
 
         // 1. Direct invocation based on detected file manager:
