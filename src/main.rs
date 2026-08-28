@@ -397,13 +397,53 @@ pub fn save_file_dialog(default_name: &str, filter_ext: &str) -> Option<PathBuf>
 }
 
 #[cfg(target_os = "linux")]
+static DBUS_FM_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+struct InFlightGuard;
+
+#[cfg(target_os = "linux")]
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        DBUS_FM_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Sends a lightweight D-Bus IPC request to `org.freedesktop.FileManager1`.
+///
+/// Note on cancellation: `zbus::blocking::Connection` does not support preemptive socket abortion
+/// once a blocking read begins in the kernel. To guarantee safety and prevent resource leaks:
+/// 1. `DBUS_FM_IN_FLIGHT` limits concurrency to at most one active D-Bus thread, preventing thread accumulation
+///    even if the session bus is unresponsive and the user clicks repeatedly.
+/// 2. An `Arc<AtomicBool>` cancel flag is set upon timeout (1500 ms), signaling the worker to abort immediately
+///    once the current blocking call unblocks, preventing subsequent method executions or late responses.
+/// 3. If a timeout occurs, the caller proceeds to the CLI fallback as a best-effort recovery.
+#[cfg(target_os = "linux")]
 fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> Result<(), String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Prevent thread accumulation: allow at most one in-flight D-Bus call at a time
+    if DBUS_FM_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("D-Bus FileManager1 call already in progress".to_string());
+    }
+
     let (done_tx, done_rx) = crossbeam_channel::bounded(1);
     let uri_str = uri.to_string();
+    let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+    let cancelled_worker = cancelled.clone();
 
     let spawn_res = thread::Builder::new()
         .name("dbus-fm-call".to_string())
         .spawn(move || {
+            let _guard = InFlightGuard;
+
+            if cancelled_worker.load(Ordering::SeqCst) {
+                return;
+            }
+
             let conn = match zbus::blocking::Connection::session() {
                 Ok(c) => c,
                 Err(e) => {
@@ -421,6 +461,10 @@ fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> Result<(), String> {
             let mut method_errors = Vec::new();
 
             for method in methods {
+                if cancelled_worker.load(Ordering::SeqCst) {
+                    return;
+                }
+
                 let uris = [uri_str.as_str()];
                 match conn.call_method(
                     Some("org.freedesktop.FileManager1"),
@@ -439,11 +483,14 @@ fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> Result<(), String> {
                 }
             }
 
-            let error_summary = method_errors.join("; ");
-            let _ = done_tx.send(Err(format!("FileManager1 method calls failed: {error_summary}")));
+            if !cancelled_worker.load(Ordering::SeqCst) {
+                let error_summary = method_errors.join("; ");
+                let _ = done_tx.send(Err(format!("FileManager1 method calls failed: {error_summary}")));
+            }
         });
 
     if let Err(e) = spawn_res {
+        DBUS_FM_IN_FLIGHT.store(false, Ordering::SeqCst);
         return Err(format!("Failed to spawn D-Bus thread: {e}"));
     }
 
@@ -451,9 +498,11 @@ fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> Result<(), String> {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e),
         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            cancelled.store(true, Ordering::SeqCst);
             Err("D-Bus FileManager1 call timed out (1500 ms)".to_string())
         }
         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            cancelled.store(true, Ordering::SeqCst);
             Err("D-Bus thread disconnected unexpectedly".to_string())
         }
     }
