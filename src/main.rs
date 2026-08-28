@@ -2093,4 +2093,27 @@ mod tests {
         assert_eq!(file_type_color("TXT"), PURPLE);
         assert_eq!(file_type_color("UNKNOWN"), TEXT_MED);
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_show_in_file_manager_dbus_execution_or_graceful_error() {
+        let start = std::time::Instant::now();
+        // Even if session bus or FileManager1 is not running (e.g. CI), it must return cleanly within timeout
+        let res = show_in_file_manager_dbus("file:///tmp", true);
+        let elapsed = start.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(3), "D-Bus call must not hang indefinitely");
+        // Result is either Ok (if FM daemon is running) or Err with descriptive failure
+        if let Err(e) = res {
+            assert!(!e.is_empty(), "Error message must be descriptive");
+        }
+    }
+
+    #[test]
+    fn test_show_in_file_manager_existing_temp_path_does_not_panic() {
+        let temp_file = std::env::temp_dir().join(format!("doxsearch-test-fm-{}.tmp", std::process::id()));
+        std::fs::write(&temp_file, b"test").unwrap();
+        // show_in_file_manager should attempt D-Bus, then fallback, without panicking
+        let _ = show_in_file_manager(&temp_file);
+        let _ = std::fs::remove_file(temp_file);
+    }
 }
