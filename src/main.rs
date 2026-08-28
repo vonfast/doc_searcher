@@ -271,18 +271,9 @@ pub fn os_file_manager_name(lang: AppLanguage) -> &'static str {
 
     #[cfg(target_os = "linux")]
     {
-        match detect_linux_file_manager() {
-            LinuxFileManager::Dolphin => "Dolphin",
-            LinuxFileManager::Nautilus => match lang {
-                AppLanguage::Finnish => "Tiedostot (Nautilus)",
-                AppLanguage::English => "Files (Nautilus)",
-            },
-            LinuxFileManager::Nemo => "Nemo",
-            LinuxFileManager::Thunar => "Thunar",
-            LinuxFileManager::Generic => match lang {
-                AppLanguage::Finnish => "Tiedostonhallinta",
-                AppLanguage::English => "File Manager",
-            },
+        match lang {
+            AppLanguage::Finnish => "Tiedostonhallinta",
+            AppLanguage::English => "File Manager",
         }
     }
 
