@@ -1,6 +1,6 @@
 # DoXsearch
 
-A blazingly fast, multi-threaded desktop document search tool built in **Rust** with a sleek GUI powered by **`egui`**.
+A blazingly fast, multi-threaded desktop document search tool built in **Rust** with a sleek GUI powered by **`Slint`**.
 
 DoXsearch allows you to instantly search for text inside **DOCX**, **ODT**, **PDF**, and **plain text files** (`.txt`, `.md`, `.csv`, `.log`, `.json`, `.xml`, `.yaml`, `.toml`, etc.) across entire directory trees.
 
@@ -91,7 +91,7 @@ cargo run --release
 ## Tech Stack
 
 - **Language:** Rust (2021 Edition)
-- **GUI Framework:** [`eframe`](https://crates.io/crates/eframe) / [`egui`](https://crates.io/crates/egui) (v0.27)
+- **GUI Framework:** [`Slint`](https://slint.dev/) (v1.9)
 - **Parallel Processing:** [`rayon`](https://crates.io/crates/rayon)
 - **Document Parsing:** [`pdf-extract`](https://crates.io/crates/pdf-extract), [`quick-xml`](https://crates.io/crates/quick-xml), [`zip`](https://crates.io/crates/zip)
 - **Date Formatting:** [`chrono`](https://crates.io/crates/chrono)

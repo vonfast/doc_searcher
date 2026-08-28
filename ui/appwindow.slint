@@ -1,0 +1,976 @@
+import { Button, CheckBox, ComboBox, LineEdit, ScrollView, Slider, ProgressIndicator, HorizontalBox, VerticalBox } from "std-widgets.slint";
+
+export struct SearchResultItem {
+    file-path: string,
+    file-name: string,
+    dir-path: string,
+    file-type: string,
+    badge-bg: color,
+    badge-fg: color,
+    date-str: string,
+    matches-count: int,
+    matches-label: string,
+    is-selected: bool,
+}
+
+export struct MatchItem {
+    index-label: string,
+    context-text: string,
+    query: string,
+}
+
+export struct ErrorItem {
+    file-name: string,
+    error-message: string,
+}
+
+component TypeToggle inherits Rectangle {
+    in property <string> text;
+    in-out property <bool> checked;
+    in property <color> active-color: #3b82f6;
+    callback toggled();
+
+    height: 30px;
+    border-radius: 6px;
+    border-width: 1.5px;
+    border-color: checked ? active-color : #cbd5e1;
+    background: checked ? active-color : #f8fafc;
+    animate background { duration: 150ms; }
+    animate border-color { duration: 150ms; }
+
+    HorizontalLayout {
+        alignment: center;
+        spacing: 4px;
+        padding-left: 8px;
+        padding-right: 8px;
+
+        if checked: Text {
+            text: "✓";
+            color: #ffffff;
+            font-size: 11px;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+
+        Text {
+            text: root.text;
+            color: checked ? #ffffff : #475569;
+            font-size: 12px;
+            font-weight: 600;
+            font-family: "monospace";
+            vertical-alignment: center;
+        }
+    }
+
+    TouchArea {
+        clicked => {
+            root.checked = !root.checked;
+            root.toggled();
+        }
+        mouse-cursor: pointer;
+    }
+}
+
+component QuickFolderBtn inherits Rectangle {
+    in property <string> text;
+    callback clicked();
+
+    height: 26px;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: touch.has-hover ? #94a3b8 : #e2e8f0;
+    background: touch.pressed ? #e2e8f0 : (touch.has-hover ? #f1f5f9 : #ffffff);
+    animate background { duration: 100ms; }
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        alignment: center;
+        Text {
+            text: root.text;
+            color: #334155;
+            font-size: 11px;
+            font-weight: 500;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+        mouse-cursor: pointer;
+    }
+}
+
+component MiniActionBtn inherits Rectangle {
+    in property <string> text;
+    in property <color> text-color: #2563eb;
+    in property <color> bg-color: #eff6ff;
+    callback clicked();
+
+    height: 24px;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: touch.has-hover ? text-color : #e2e8f0;
+    background: touch.pressed ? #dbeafe : (touch.has-hover ? bg-color : #ffffff);
+    animate background { duration: 100ms; }
+
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        alignment: center;
+        Text {
+            text: root.text;
+            color: root.text-color;
+            font-size: 11px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+        mouse-cursor: pointer;
+    }
+}
+
+component PrimaryActionBtn inherits Rectangle {
+    in property <string> text;
+    in property <color> bg-color: #2563eb;
+    in property <color> hover-color: #1d4ed8;
+    in property <color> text-color: #ffffff;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: 36px;
+    border-radius: 6px;
+    background: !enabled ? #cbd5e1 : (touch.pressed ? #1e40af : (touch.has-hover ? hover-color : bg-color));
+    animate background { duration: 150ms; }
+
+    HorizontalLayout {
+        alignment: center;
+        padding-left: 12px;
+        padding-right: 12px;
+        Text {
+            text: root.text;
+            color: root.text-color;
+            font-size: 14px;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+        mouse-cursor: root.enabled ? pointer : default;
+    }
+}
+
+component ResultCard inherits Rectangle {
+    in property <SearchResultItem> item;
+    in property <bool> is-selected;
+    callback select-item();
+    callback open-file();
+    callback show-folder();
+    callback copy-path();
+
+    in property <string> text-open: "Avaa";
+    in property <string> text-folder: "Kansio";
+    in property <string> text-copy: "Kopioi";
+
+    border-radius: 8px;
+    border-width: is-selected ? 2px : 1px;
+    border-color: is-selected ? #2563eb : (card-touch.has-hover ? #93c5fd : #e2e8f0);
+    background: is-selected ? #eff6ff : (card-touch.has-hover ? #f8fafc : #ffffff);
+    animate background { duration: 100ms; }
+    animate border-color { duration: 100ms; }
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 6px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+
+            Rectangle {
+                width: 44px;
+                height: 20px;
+                border-radius: 4px;
+                background: item.badge-bg;
+                Text {
+                    text: item.file-type;
+                    color: item.badge-fg;
+                    font-size: 11px;
+                    font-weight: 700;
+                    font-family: "monospace";
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            Text {
+                text: item.file-name;
+                color: is-selected ? #1e3a8a : #0f172a;
+                font-size: 13px;
+                font-weight: 700;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+        }
+
+        Text {
+            text: item.dir-path;
+            color: #64748b;
+            font-size: 11px;
+            font-family: "monospace";
+            overflow: elide;
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: item.date-str;
+                color: #64748b;
+                font-size: 10px;
+                font-family: "monospace";
+                vertical-alignment: center;
+            }
+            Text {
+                text: "•";
+                color: #94a3b8;
+                font-size: 10px;
+                vertical-alignment: center;
+            }
+            Text {
+                text: item.matches-label;
+                color: #2563eb;
+                font-size: 11px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+            MiniActionBtn {
+                text: root.text-open;
+                text-color: #2563eb;
+                bg-color: #eff6ff;
+                clicked => { root.open-file(); }
+            }
+            MiniActionBtn {
+                text: root.text-folder;
+                text-color: #475569;
+                bg-color: #f1f5f9;
+                clicked => { root.show-folder(); }
+            }
+            MiniActionBtn {
+                text: root.text-copy;
+                text-color: #475569;
+                bg-color: #f1f5f9;
+                clicked => { root.copy-path(); }
+            }
+        }
+    }
+
+    card-touch := TouchArea {
+        clicked => { root.select-item(); }
+        mouse-cursor: pointer;
+    }
+}
+
+component MatchCard inherits Rectangle {
+    in property <MatchItem> item;
+    in property <string> text-copy: "Kopioi";
+    callback copy-context();
+
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: #e2e8f0;
+    background: #ffffff;
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+
+        HorizontalLayout {
+            alignment: space-between;
+            Text {
+                text: item.index-label;
+                color: #1e3a8a;
+                font-size: 12px;
+                font-weight: 700;
+                font-family: "monospace";
+                vertical-alignment: center;
+            }
+
+            MiniActionBtn {
+                text: root.text-copy;
+                text-color: #475569;
+                bg-color: #f1f5f9;
+                clicked => { root.copy-context(); }
+            }
+        }
+
+        Rectangle {
+            border-radius: 4px;
+            background: #f8fafc;
+            border-width: 1px;
+            border-color: #f1f5f9;
+
+            HorizontalLayout {
+                padding: 8px;
+                Text {
+                    text: item.context-text;
+                    color: #1e293b;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "DoXsearch";
+    min-width: 1000px;
+    min-height: 680px;
+    preferred-width: 1200px;
+    preferred-height: 780px;
+    background: #f8fafc;
+
+    // Callbacks to Rust
+    callback start-search();
+    callback cancel-search();
+    callback clear-search();
+    callback browse-folder();
+    callback quick-folder(string);
+    callback select-recent-folder(int);
+    callback select-result(int);
+    callback open-file(string);
+    callback show-in-folder(string);
+    callback copy-to-clipboard(string);
+    callback save-results-csv();
+    callback clear-cache();
+    callback toggle-all-filetypes();
+    callback change-language(string);
+    callback sort-changed(int);
+    callback date-filter-changed(int);
+    callback size-filter-changed(int);
+    callback directory-submitted();
+    callback query-submitted();
+
+    // UI state properties
+    in-out property <string> directory-input: "";
+    in-out property <string> query-input: "";
+    in-out property <bool> is-searching: false;
+    in-out property <int> search-state: 0;
+    in-out property <float> progress-fraction: 0.0;
+    in-out property <string> progress-text: "";
+    in-out property <string> status-info: "";
+    in-out property <string> status-error: "";
+    in-out property <string> stats-summary: "";
+    in-out property <string> stats-timing: "";
+    in-out property <string> cache-info: "";
+    in-out property <bool> cache-has-items: false;
+
+    // Search options
+    in-out property <bool> opt-ignore-case: true;
+    in-out property <bool> opt-recursive: true;
+    in-out property <bool> opt-search-hidden: false;
+    in-out property <bool> opt-use-cache: true;
+    in-out property <bool> opt-docx: true;
+    in-out property <bool> opt-odt: true;
+    in-out property <bool> opt-pdf: true;
+    in-out property <bool> opt-txt: true;
+    in-out property <float> opt-context-size: 150.0;
+
+    // Combos & Selection
+    in-out property <int> sort-order-index: 0;
+    in-out property <int> date-filter-index: 0;
+    in-out property <int> size-filter-index: 0;
+    in-out property <[string]> sort-options: ["Päivämäärä (Uusin ensin)", "Päivämäärä (Vanhin ensin)", "Nimi (A-Z)", "Osumien määrä"];
+    in-out property <[string]> date-options: ["Kaikki ajat", "Viimeiset 24 tuntia", "Viimeiset 7 päivää", "Viimeiset 30 päivää", "Viimeinen vuosi"];
+    in-out property <[string]> size-options: ["Ei kokorajoitusta", "Enintään 10 MB", "Enintään 50 MB", "Enintään 100 MB"];
+    in-out property <[string]> recent-directories: [];
+    in-out property <[string]> language-options: ["Suomi", "English"];
+    in-out property <string> current-language: "Suomi";
+
+    // Results & Selection
+    in-out property <[SearchResultItem]> results: [];
+    in-out property <int> selected-index: -1;
+    in-out property <string> selected-filename: "";
+    in-out property <string> selected-filepath: "";
+    in-out property <string> selected-matches-header: "";
+    in-out property <[MatchItem]> selected-matches: [];
+    in-out property <[ErrorItem]> errors: [];
+    in-out property <bool> has-errors: false;
+    in-out property <string> errors-header: "Virheet (0)";
+
+    // Localized labels
+    in-out property <string> text-subtitle: "| Etsi tekstiä DOCX-, ODT-, PDF- ja tekstitiedostoista";
+    in-out property <string> text-dir-label: "Hakemisto";
+    in-out property <string> text-browse: "Selaa...";
+    in-out property <string> text-home: "~ Koti";
+    in-out property <string> text-docs: "Asiakirjat";
+    in-out property <string> text-downloads: "Lataukset";
+    in-out property <string> text-query-label: "Hakusana";
+    in-out property <string> text-query-hint: "Kirjoita hakusana...";
+    in-out property <string> text-settings-label: "Asetukset";
+    in-out property <string> text-ignore-case: "Älä huomioi kirjainkokoa";
+    in-out property <string> text-recursive: "Rekursiivinen haku";
+    in-out property <string> text-search-hidden: "Hae piilokansioista";
+    in-out property <string> text-use-cache: "Käytä välimuistia";
+    in-out property <string> text-clear-cache: "Tyhjennä";
+    in-out property <string> text-filetypes-label: "Tiedostotyypit:";
+    in-out property <string> text-all-filetypes: "Kaikki";
+    in-out property <string> text-date-range: "Aikarajaus:";
+    in-out property <string> text-max-size: "Maksimikoko:";
+    in-out property <string> text-context-size: "Kontekstin pituus:";
+    in-out property <string> text-search: "Hae";
+    in-out property <string> text-searching: "Haetaan...";
+    in-out property <string> text-cancel: "Peruuta";
+    in-out property <string> text-clear: "Tyhjennä";
+    in-out property <string> text-save-results: "Tallenna tulokset...";
+    in-out property <string> text-results-header: "Tiedostot";
+    in-out property <string> text-open: "Avaa";
+    in-out property <string> text-open-file: "Avaa tiedosto";
+    in-out property <string> text-folder: "Kansio";
+    in-out property <string> text-show-in-folder: "Näytä kansiossa";
+    in-out property <string> text-copy-path: "Kopioi polku";
+    in-out property <string> text-copy: "Kopioi";
+    in-out property <string> text-empty-prompt: "Kirjoita hakusana ja paina Hae";
+    in-out property <string> text-no-matches: "Ei osumia hakusanalle";
+    in-out property <string> text-select-file: "Valitse tiedosto listasta";
+    in-out property <string> text-recent-folders: "Viimeisimmät kansiot...";
+
+    VerticalLayout {
+        spacing: 0;
+
+        // TOP BAR
+        Rectangle {
+            height: 54px;
+            background: #ffffff;
+
+            HorizontalLayout {
+                padding-left: 20px;
+                padding-right: 20px;
+                alignment: space-between;
+
+                HorizontalLayout {
+                    spacing: 12px;
+                    alignment: start;
+
+                    Text {
+                        text: "DoXsearch";
+                        color: #1e3a8a;
+                        font-size: 20px;
+                        font-weight: 800;
+                        vertical-alignment: center;
+                    }
+
+                    Text {
+                        text: root.text-subtitle;
+                        color: #64748b;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+
+                    ComboBox {
+                        width: 120px;
+                        model: root.language-options;
+                        current-value: root.current-language;
+                        selected(val) => {
+                            root.current-language = val;
+                            root.change-language(val);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Top bar separator
+        Rectangle { height: 1px; background: #e2e8f0; }
+
+        // MAIN CONTENT (3 Panels)
+        HorizontalLayout {
+            spacing: 0;
+
+            // PANEL 1: LEFT SIDEBAR (Search controls & filters)
+            Rectangle {
+                width: 310px;
+                background: #ffffff;
+
+                ScrollView {
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 12px;
+
+                        // Directory
+                        VerticalLayout {
+                            spacing: 4px;
+                            Text {
+                                text: root.text-dir-label;
+                                color: #334155;
+                                font-size: 12px;
+                                font-weight: 700;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 6px;
+                                LineEdit {
+                                    text <=> root.directory-input;
+                                    placeholder-text: "/home/user/docs";
+                                    font-size: 12px;
+                                    accepted => { root.directory-submitted(); }
+                                }
+                                MiniActionBtn {
+                                    text: root.text-browse;
+                                    text-color: #2563eb;
+                                    bg-color: #eff6ff;
+                                    clicked => { root.browse-folder(); }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 4px;
+                                QuickFolderBtn { text: root.text-home; clicked => { root.quick-folder("home"); } }
+                                QuickFolderBtn { text: root.text-docs; clicked => { root.quick-folder("docs"); } }
+                                QuickFolderBtn { text: root.text-downloads; clicked => { root.quick-folder("dl"); } }
+                            }
+
+                            if root.recent-directories.length > 0: ComboBox {
+                                model: root.recent-directories;
+                                current-value: root.text-recent-folders;
+                                selected(val) => {
+                                    root.directory-input = val;
+                                }
+                            }
+                        }
+
+                        Rectangle { height: 1px; background: #e2e8f0; }
+
+                        // Search Query
+                        VerticalLayout {
+                            spacing: 4px;
+                            Text {
+                                text: root.text-query-label;
+                                color: #334155;
+                                font-size: 12px;
+                                font-weight: 700;
+                            }
+
+                            LineEdit {
+                                text <=> root.query-input;
+                                placeholder-text: root.text-query-hint;
+                                font-size: 13px;
+                                accepted => { root.query-submitted(); }
+                            }
+                        }
+
+                        Rectangle { height: 1px; background: #e2e8f0; }
+
+                        // Checkboxes & Settings
+                        VerticalLayout {
+                            spacing: 6px;
+                            Text {
+                                text: root.text-settings-label;
+                                color: #334155;
+                                font-size: 12px;
+                                font-weight: 700;
+                            }
+
+                            CheckBox {
+                                text: root.text-ignore-case;
+                                checked <=> root.opt-ignore-case;
+                            }
+                            CheckBox {
+                                text: root.text-recursive;
+                                checked <=> root.opt-recursive;
+                            }
+                            CheckBox {
+                                text: root.text-search-hidden;
+                                checked <=> root.opt-search-hidden;
+                            }
+                            CheckBox {
+                                text: root.text-use-cache;
+                                checked <=> root.opt-use-cache;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 6px;
+                                alignment: space-between;
+                                Text {
+                                    text: root.cache-info;
+                                    color: #64748b;
+                                    font-size: 11px;
+                                    vertical-alignment: center;
+                                }
+                                if root.cache-has-items: MiniActionBtn {
+                                    text: root.text-clear-cache;
+                                    text-color: #ef4444;
+                                    bg-color: #fef2f2;
+                                    clicked => { root.clear-cache(); }
+                                }
+                            }
+                        }
+
+                        Rectangle { height: 1px; background: #e2e8f0; }
+
+                        // File Types
+                        VerticalLayout {
+                            spacing: 6px;
+                            HorizontalLayout {
+                                alignment: space-between;
+                                Text {
+                                    text: root.text-filetypes-label;
+                                    color: #334155;
+                                    font-size: 12px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                                MiniActionBtn {
+                                    text: root.text-all-filetypes;
+                                    text-color: #2563eb;
+                                    bg-color: #eff6ff;
+                                    clicked => { root.toggle-all-filetypes(); }
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 4px;
+                                TypeToggle { text: "DOCX"; checked <=> root.opt-docx; active-color: #2563eb; }
+                                TypeToggle { text: "ODT";  checked <=> root.opt-odt;  active-color: #16a34a; }
+                                TypeToggle { text: "PDF";  checked <=> root.opt-pdf;  active-color: #ea580c; }
+                                TypeToggle { text: "TXT";  checked <=> root.opt-txt;  active-color: #9333ea; }
+                            }
+                        }
+
+                        Rectangle { height: 1px; background: #e2e8f0; }
+
+                        // Date & Size Filters
+                        VerticalLayout {
+                            spacing: 8px;
+                            VerticalLayout {
+                                spacing: 2px;
+                                Text { text: root.text-date-range; color: #475569; font-size: 11px; font-weight: 600; }
+                                ComboBox {
+                                    model: root.date-options;
+                                    current-index <=> root.date-filter-index;
+                                    selected(val) => { root.date-filter-changed(root.date-filter-index); }
+                                }
+                            }
+
+                            VerticalLayout {
+                                spacing: 2px;
+                                Text { text: root.text-max-size; color: #475569; font-size: 11px; font-weight: 600; }
+                                ComboBox {
+                                    model: root.size-options;
+                                    current-index <=> root.size-filter-index;
+                                    selected(val) => { root.size-filter-changed(root.size-filter-index); }
+                                }
+                            }
+
+                            VerticalLayout {
+                                spacing: 2px;
+                                Text { text: root.text-context-size + " (" + round(root.opt-context-size) + ")"; color: #475569; font-size: 11px; font-weight: 600; }
+                                Slider {
+                                    minimum: 50.0;
+                                    maximum: 500.0;
+                                    value <=> root.opt-context-size;
+                                }
+                            }
+                        }
+
+                        Rectangle { height: 1px; background: #e2e8f0; }
+
+                        // Search Buttons
+                        HorizontalLayout {
+                            spacing: 8px;
+                            if !root.is-searching: PrimaryActionBtn {
+                                text: root.text-search;
+                                bg-color: #2563eb;
+                                hover-color: #1d4ed8;
+                                clicked => { root.start-search(); }
+                            }
+                            if root.is-searching: PrimaryActionBtn {
+                                text: root.text-cancel;
+                                bg-color: #ef4444;
+                                hover-color: #dc2626;
+                                clicked => { root.cancel-search(); }
+                            }
+                            PrimaryActionBtn {
+                                text: root.text-clear;
+                                bg-color: #64748b;
+                                hover-color: #475569;
+                                clicked => { root.clear-search(); }
+                            }
+                        }
+
+                        // Progress Indicator
+                        if root.is-searching: VerticalLayout {
+                            spacing: 4px;
+                            ProgressIndicator {
+                                progress: root.progress-fraction;
+                            }
+                            Text {
+                                text: root.progress-text;
+                                color: #64748b;
+                                font-size: 11px;
+                                horizontal-alignment: center;
+                            }
+                        }
+
+                        // Status / Info / Error
+                        if root.status-error != "": Text {
+                            text: root.status-error;
+                            color: #dc2626;
+                            font-size: 12px;
+                            font-weight: 600;
+                            wrap: word-wrap;
+                        }
+
+                        if root.status-info != "": Text {
+                            text: root.status-info;
+                            color: #16a34a;
+                            font-size: 12px;
+                            font-weight: 600;
+                            wrap: word-wrap;
+                        }
+
+                        // Search Done Stats
+                        if root.search-state == 2: VerticalLayout {
+                            spacing: 6px;
+                            Text {
+                                text: root.stats-summary;
+                                color: #15803d;
+                                font-size: 13px;
+                                font-weight: 700;
+                                wrap: word-wrap;
+                            }
+                            if root.stats-timing != "": Text {
+                                text: root.stats-timing;
+                                color: #64748b;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                            MiniActionBtn {
+                                text: root.text-save-results;
+                                text-color: #2563eb;
+                                bg-color: #eff6ff;
+                                clicked => { root.save-results-csv(); }
+                            }
+                        }
+
+                        // Errors Collapsible
+                        if root.has-errors: VerticalLayout {
+                            spacing: 4px;
+                            Text {
+                                text: root.errors-header;
+                                color: #dc2626;
+                                font-size: 12px;
+                                font-weight: 700;
+                            }
+                            for err in root.errors: Text {
+                                text: "• " + err.file-name + ": " + err.error-message;
+                                color: #ef4444;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Panel divider
+            Rectangle { width: 1px; background: #e2e8f0; }
+
+            // PANEL 2: CENTER FILE LIST
+            Rectangle {
+                width: 360px;
+                background: #f8fafc;
+
+                VerticalLayout {
+                    spacing: 0;
+
+                    // Results header + Sort
+                    Rectangle {
+                        height: 46px;
+                        background: #ffffff;
+
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            alignment: space-between;
+
+                            Text {
+                                text: root.text-results-header + " (" + root.results.length + ")";
+                                color: #1e293b;
+                                font-size: 13px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+
+                            ComboBox {
+                                width: 170px;
+                                model: root.sort-options;
+                                current-index <=> root.sort-order-index;
+                                selected(val) => { root.sort-changed(root.sort-order-index); }
+                            }
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: #e2e8f0; }
+
+                    // Results List (Cards)
+                    if root.results.length > 0: ScrollView {
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 8px;
+
+                            for item[index] in root.results: ResultCard {
+                                item: item;
+                                is-selected: item.is-selected;
+                                text-open: root.text-open;
+                                text-folder: root.text-folder;
+                                text-copy: root.text-copy;
+                                select-item => { root.select-result(index); }
+                                open-file => { root.open-file(item.file-path); }
+                                show-folder => { root.show-in-folder(item.file-path); }
+                                copy-path => { root.copy-to-clipboard(item.file-path); }
+                            }
+                        }
+                    }
+
+                    if root.results.length == 0: VerticalLayout {
+                        alignment: center;
+                        padding: 20px;
+                        Text {
+                            text: root.search-state == 1 ? root.text-searching : (root.search-state == 2 ? root.text-no-matches + " \"" + root.query-input + "\"" : root.text-empty-prompt);
+                            color: #94a3b8;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+
+            // Panel divider
+            Rectangle { width: 1px; background: #e2e8f0; }
+
+            // PANEL 3: RIGHT DETAIL PREVIEW (Match snippets)
+            Rectangle {
+                background: #f1f5f9;
+
+                VerticalLayout {
+                    spacing: 0;
+
+                    if root.selected-index >= 0: VerticalLayout {
+                        spacing: 0;
+
+                        // Detail Header
+                        Rectangle {
+                            height: 70px;
+                            background: #ffffff;
+
+                            VerticalLayout {
+                                padding-left: 16px;
+                                padding-right: 16px;
+                                padding-top: 8px;
+                                padding-bottom: 8px;
+                                alignment: space-between;
+
+                                HorizontalLayout {
+                                    alignment: space-between;
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Text {
+                                            text: root.selected-filename;
+                                            color: #0f172a;
+                                            font-size: 16px;
+                                            font-weight: 800;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                        }
+                                        Text {
+                                            text: root.selected-matches-header;
+                                            color: #2563eb;
+                                            font-size: 13px;
+                                            font-weight: 600;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        MiniActionBtn {
+                                            text: root.text-open-file;
+                                            text-color: #2563eb;
+                                            bg-color: #eff6ff;
+                                            clicked => { root.open-file(root.selected-filepath); }
+                                        }
+                                        MiniActionBtn {
+                                            text: root.text-show-in-folder;
+                                            text-color: #475569;
+                                            bg-color: #f1f5f9;
+                                            clicked => { root.show-in-folder(root.selected-filepath); }
+                                        }
+                                        MiniActionBtn {
+                                            text: root.text-copy-path;
+                                            text-color: #475569;
+                                            bg-color: #f1f5f9;
+                                            clicked => { root.copy-to-clipboard(root.selected-filepath); }
+                                        }
+                                    }
+                                }
+
+                                Text {
+                                    text: root.selected-filepath;
+                                    color: #64748b;
+                                    font-size: 11px;
+                                    font-family: "monospace";
+                                    overflow: elide;
+                                }
+                            }
+                        }
+
+                        Rectangle { height: 1px; background: #e2e8f0; }
+
+                        // Match Snippets List
+                        ScrollView {
+                            VerticalLayout {
+                                padding: 14px;
+                                spacing: 10px;
+
+                                for match in root.selected-matches: MatchCard {
+                                    item: match;
+                                    text-copy: root.text-copy;
+                                    copy-context => { root.copy-to-clipboard(match.context-text); }
+                                }
+                            }
+                        }
+                    }
+
+                    if root.selected-index < 0: VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: root.results.length > 0 ? root.text-select-file : root.text-empty-prompt;
+                            color: #94a3b8;
+                            font-size: 16px;
+                            font-weight: 500;
+                            horizontal-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
