@@ -409,17 +409,23 @@ impl Drop for InFlightGuard {
     }
 }
 
+#[cfg(target_os = "linux")]
+enum DbusFmOutcome {
+    Success,
+    Unavailable(String),
+    TimedOutOrBusy(String),
+}
+
 /// Sends a lightweight D-Bus IPC request to `org.freedesktop.FileManager1`.
 ///
-/// Note on cancellation: `zbus::blocking::Connection` does not support preemptive socket abortion
-/// once a blocking read begins in the kernel. To guarantee safety and prevent resource leaks:
-/// 1. `DBUS_FM_IN_FLIGHT` limits concurrency to at most one active D-Bus thread, preventing thread accumulation
-///    even if the session bus is unresponsive and the user clicks repeatedly.
-/// 2. An `Arc<AtomicBool>` cancel flag is set upon timeout (1500 ms), signaling the worker to abort immediately
-///    once the current blocking call unblocks, preventing subsequent method executions or late responses.
-/// 3. If a timeout occurs, the caller proceeds to the CLI fallback as a best-effort recovery.
+/// Note on cancellation and duplicate windows:
+/// - `DBUS_FM_IN_FLIGHT` guarantees at most one D-Bus worker thread runs concurrently.
+/// - If D-Bus is unavailable (e.g. no session bus or no FileManager1 service), it fails immediately
+///   and safely triggers the CLI fallback.
+/// - If D-Bus times out (busy or slow daemon), we do NOT trigger the CLI fallback to prevent opening
+///   two competing file manager windows once the daemon wakes up.
 #[cfg(target_os = "linux")]
-fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> Result<(), String> {
+fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> DbusFmOutcome {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     // Prevent thread accumulation: allow at most one in-flight D-Bus call at a time
@@ -427,7 +433,7 @@ fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> Result<(), String> {
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        return Err("D-Bus FileManager1 call already in progress".to_string());
+        return DbusFmOutcome::TimedOutOrBusy("D-Bus FileManager1 call already in progress".to_string());
     }
 
     let (done_tx, done_rx) = crossbeam_channel::bounded(1);
@@ -491,19 +497,19 @@ fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> Result<(), String> {
 
     if let Err(e) = spawn_res {
         DBUS_FM_IN_FLIGHT.store(false, Ordering::SeqCst);
-        return Err(format!("Failed to spawn D-Bus thread: {e}"));
+        return DbusFmOutcome::Unavailable(format!("Failed to spawn D-Bus thread: {e}"));
     }
 
     match done_rx.recv_timeout(std::time::Duration::from_millis(1500)) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e),
+        Ok(Ok(())) => DbusFmOutcome::Success,
+        Ok(Err(e)) => DbusFmOutcome::Unavailable(e),
         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
             cancelled.store(true, Ordering::SeqCst);
-            Err("D-Bus FileManager1 call timed out (1500 ms)".to_string())
+            DbusFmOutcome::TimedOutOrBusy("D-Bus FileManager1 call timed out (1500 ms)".to_string())
         }
         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
             cancelled.store(true, Ordering::SeqCst);
-            Err("D-Bus thread disconnected unexpectedly".to_string())
+            DbusFmOutcome::Unavailable("D-Bus thread disconnected unexpectedly".to_string())
         }
     }
 }
@@ -552,12 +558,19 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
         // 1. Ensisijainen: Kevyt D-Bus IPC (org.freedesktop.FileManager1) zbus-kirjaston kautta.
         // Ei luo uutta prosessia ja pyytää taustalla olevaa tiedostonhallintaa korostamaan kohteen.
         match show_in_file_manager_dbus(&uri, is_dir) {
-            Ok(()) => Ok(()),
-            Err(dbus_err) => {
+            DbusFmOutcome::Success => Ok(()),
+            DbusFmOutcome::TimedOutOrBusy(msg) => {
                 #[cfg(debug_assertions)]
-                eprintln!("[DoXsearch] D-Bus FileManager1 failed: {dbus_err}. Falling back to CLI selection...");
+                eprintln!("[DoXsearch] D-Bus in progress/timed out ({msg}); waiting for D-Bus without spawning duplicate CLI process.");
+                // Pyyntö on D-Bus-väylällä työn alla. Emme käynnistä rinnakkaista CLI-prosessia,
+                // jotta vältetään kahden ikkunan aukeaminen (kaksoisavaus).
+                Ok(())
+            }
+            DbusFmOutcome::Unavailable(dbus_err) => {
+                #[cfg(debug_assertions)]
+                eprintln!("[DoXsearch] D-Bus FileManager1 unavailable: {dbus_err}. Falling back to CLI selection...");
 
-                // 2. Toissijainen varatapa: Jos D-Bus ei ole käytettävissä (esim. SSH, rikkinäinen väylä tai rajoitettu Flatpak),
+                // 2. Toissijainen varatapa: Jos D-Bus ei ole lainkaan käytettävissä (esim. SSH, rikkinäinen väylä tai rajoitettu Flatpak),
                 // yritetään suoraa tiedostonhallintakomentoa valintalipun (--select) kera kohteen korostamiseksi.
                 let fm = detect_linux_file_manager();
                 let cli_spawn_ok = match fm {
@@ -614,7 +627,7 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
                     canonical.parent().unwrap_or(&canonical)
                 };
                 open::that(target).map_err(|fallback_err| {
-                    format!("Failed to open in file manager: {fallback_err} (D-Bus IPC failed: {dbus_err})")
+                    format!("Failed to open in file manager: {fallback_err} (D-Bus IPC unavailable: {dbus_err})")
                 })
             }
         }
@@ -2204,12 +2217,13 @@ mod tests {
     fn test_show_in_file_manager_dbus_execution_or_graceful_error() {
         let start = std::time::Instant::now();
         // Even if session bus or FileManager1 is not running (e.g. CI), it must return cleanly within timeout
-        let res = show_in_file_manager_dbus("file:///tmp", true);
+        let outcome = show_in_file_manager_dbus("file:///tmp", true);
         let elapsed = start.elapsed();
         assert!(elapsed < std::time::Duration::from_secs(3), "D-Bus call must not hang indefinitely");
-        // Result is either Ok (if FM daemon is running) or Err with descriptive failure
-        if let Err(e) = res {
-            assert!(!e.is_empty(), "Error message must be descriptive");
+        match outcome {
+            DbusFmOutcome::Success => {}
+            DbusFmOutcome::Unavailable(e) => assert!(!e.is_empty()),
+            DbusFmOutcome::TimedOutOrBusy(e) => assert!(!e.is_empty()),
         }
     }
 }
