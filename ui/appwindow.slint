@@ -1,4 +1,4 @@
-import { Button, CheckBox, ComboBox, LineEdit, ScrollView, Slider, ProgressIndicator, HorizontalBox, VerticalBox } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, ScrollView, Slider, ProgressIndicator, HorizontalBox, VerticalBox, Palette } from "std-widgets.slint";
 
 export struct SearchResultItem {
     file-path: string,
@@ -339,6 +339,10 @@ export component AppWindow inherits Window {
     preferred-width: 1200px;
     preferred-height: 780px;
     background: #f8fafc;
+
+    init => {
+        Palette.color-scheme = ColorScheme.light;
+    }
 
     // Callbacks to Rust
     callback start-search();
