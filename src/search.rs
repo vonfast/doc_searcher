@@ -88,7 +88,6 @@ pub const MAX_CACHED_ENTRY_BYTES: usize = 5 * 1024 * 1024; // 5 MB per file
 pub const MAX_CACHE_ENTRIES: usize = 10_000;
 const MAX_SHARD_BYTES: usize = MAX_CACHE_TOTAL_BYTES / NUM_SHARDS;
 const MAX_SHARD_ENTRIES: usize = MAX_CACHE_ENTRIES / NUM_SHARDS;
-pub const SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub fn clean_path(p: PathBuf) -> PathBuf {
     let s = p.to_string_lossy();
@@ -105,36 +104,8 @@ pub struct SearchCandidate {
     pub ext: String,
     #[allow(dead_code)]
     pub size: u64,
+    #[allow(dead_code)]
     pub modified: Option<std::time::SystemTime>,
-}
-
-#[derive(Clone, Debug)]
-pub struct DirectorySnapshot {
-    pub candidates: Vec<SearchCandidate>,
-    pub created_at: std::time::Instant,
-    pub recursive: bool,
-    pub search_hidden: bool,
-    pub search_docx: bool,
-    pub search_odt: bool,
-    pub search_pdf: bool,
-    pub search_txt: bool,
-    pub max_file_size_mb: Option<u64>,
-}
-
-impl DirectorySnapshot {
-    pub fn matches_opts(&self, opts: &SearchOptions) -> bool {
-        self.recursive == opts.recursive
-            && self.search_hidden == opts.search_hidden
-            && self.search_docx == opts.search_docx
-            && self.search_odt == opts.search_odt
-            && self.search_pdf == opts.search_pdf
-            && self.search_txt == opts.search_txt
-            && self.max_file_size_mb == opts.max_file_size_mb
-    }
-
-    pub fn is_expired(&self, ttl: std::time::Duration) -> bool {
-        self.created_at.elapsed() >= ttl
-    }
 }
 
 static GLOBAL_CACHE_TICK: AtomicU64 = AtomicU64::new(1);
@@ -248,14 +219,12 @@ impl CacheShard {
 
 pub struct DocumentCache {
     shards: Arc<[RwLock<CacheShard>; NUM_SHARDS]>,
-    dir_snapshots: Arc<RwLock<HashMap<PathBuf, DirectorySnapshot>>>,
 }
 
 impl Clone for DocumentCache {
     fn clone(&self) -> Self {
         Self {
             shards: Arc::clone(&self.shards),
-            dir_snapshots: Arc::clone(&self.dir_snapshots),
         }
     }
 }
@@ -271,7 +240,6 @@ impl DocumentCache {
         let shards: [RwLock<CacheShard>; NUM_SHARDS] = Default::default();
         Self {
             shards: Arc::new(shards),
-            dir_snapshots: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -296,57 +264,11 @@ impl DocumentCache {
         }
     }
 
-    pub fn get_snapshot(&self, dir: &Path, opts: &SearchOptions) -> Option<Vec<SearchCandidate>> {
-        self.get_snapshot_with_ttl(dir, opts, SNAPSHOT_TTL)
-    }
-
-    pub fn get_snapshot_with_ttl(
-        &self,
-        dir: &Path,
-        opts: &SearchOptions,
-        ttl: std::time::Duration,
-    ) -> Option<Vec<SearchCandidate>> {
-        let guard = self.dir_snapshots.read().ok()?;
-        let snap = guard.get(dir)?;
-        if snap.matches_opts(opts) && !snap.is_expired(ttl) {
-            Some(snap.candidates.clone())
-        } else {
-            None
-        }
-    }
-
-    pub fn store_snapshot(
-        &self,
-        dir: PathBuf,
-        opts: &SearchOptions,
-        candidates: Vec<SearchCandidate>,
-    ) {
-        if let Ok(mut guard) = self.dir_snapshots.write() {
-            guard.insert(
-                dir,
-                DirectorySnapshot {
-                    candidates,
-                    created_at: std::time::Instant::now(),
-                    recursive: opts.recursive,
-                    search_hidden: opts.search_hidden,
-                    search_docx: opts.search_docx,
-                    search_odt: opts.search_odt,
-                    search_pdf: opts.search_pdf,
-                    search_txt: opts.search_txt,
-                    max_file_size_mb: opts.max_file_size_mb,
-                },
-            );
-        }
-    }
-
     pub fn clear(&self) {
         for shard in self.shards.iter() {
             if let Ok(mut guard) = shard.write() {
                 guard.clear();
             }
-        }
-        if let Ok(mut guard) = self.dir_snapshots.write() {
-            guard.clear();
         }
     }
 
@@ -586,13 +508,20 @@ fn process_candidate(
     }
 
     // Verify that the file actually exists on disk before processing or checking cache.
-    // If deleted since candidate scanning / snapshot, ignore it cleanly.
+    // If deleted since candidate scanning, ignore it cleanly.
     let meta = match std::fs::metadata(&candidate.path) {
         Ok(m) => m,
         Err(_) => return,
     };
     let current_size = meta.len();
     let current_modified = meta.modified().ok();
+
+    // Date filter: strictly check the live current_modified timestamp from disk
+    if let Some(after) = opts.modified_after {
+        if !matches!(current_modified, Some(mtime) if mtime >= after) {
+            return;
+        }
+    }
 
     let cache_key = CacheKey {
         path: candidate.path.clone(),
@@ -698,31 +627,7 @@ pub fn search_directory(
         .canonicalize()
         .unwrap_or_else(|_| opts.directory.clone());
 
-    let all_candidates: Vec<SearchCandidate> = if opts.use_cache {
-        if let Some(cached) = cache.get_snapshot(&canonical_root, opts) {
-            cached
-        } else {
-            let scanned = scan_candidates(&canonical_root, opts, is_cancelled);
-            let cancelled = is_cancelled
-                .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-                .unwrap_or(false);
-            if !cancelled {
-                cache.store_snapshot(canonical_root.clone(), opts, scanned.clone());
-            }
-            scanned
-        }
-    } else {
-        scan_candidates(&canonical_root, opts, is_cancelled)
-    };
-
-    let entries: Vec<SearchCandidate> = if let Some(after) = opts.modified_after {
-        all_candidates
-            .into_iter()
-            .filter(|c| matches!(c.modified, Some(mtime) if mtime >= after))
-            .collect()
-    } else {
-        all_candidates
-    };
+    let entries = scan_candidates(&canonical_root, opts, is_cancelled);
 
     let total = entries.len();
     progress_cb(0, total);
@@ -2799,40 +2704,116 @@ mod tests {
     }
 
     #[test]
-    fn test_directory_snapshot_ttl_expiration() {
+    fn test_new_file_immediately_discovered_on_repeated_search() {
         let temp_dir =
-            std::env::temp_dir().join(format!("doxsearch_ttl_test_{}", std::process::id()));
+            std::env::temp_dir().join(format!("doxsearch_new_file_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&temp_dir);
+
+        let file1 = temp_dir.join("file1.txt");
+        std::fs::write(&file1, "Ensimmäinen tiedosto sisältää EtsittavaTeksti").unwrap();
 
         let cache = DocumentCache::new();
         let opts = SearchOptions {
             directory: temp_dir.clone(),
+            query: "EtsittavaTeksti".to_string(),
+            use_cache: true,
             ..Default::default()
         };
 
-        let candidate = SearchCandidate {
-            path: temp_dir.join("a.txt"),
-            ext: "txt".to_string(),
-            size: 10,
-            modified: None,
-        };
-        cache.store_snapshot(temp_dir.clone(), &opts, vec![candidate]);
+        // First search finds file1
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let h = hits.clone();
+        let stats1 = search_directory(
+            &opts,
+            &cache,
+            None,
+            move |r| h.lock().unwrap().push(r),
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(stats1.total_count, 1);
+        assert_eq!(hits.lock().unwrap().len(), 1);
 
-        // Fresh snapshot should be returned
-        let fresh = cache.get_snapshot(&temp_dir, &opts);
-        assert!(fresh.is_some());
-        assert_eq!(fresh.unwrap().len(), 1);
+        // User saves a new file "file2.txt" into the directory
+        let file2 = temp_dir.join("file2.txt");
+        std::fs::write(&file2, "Toinen tiedosto sisältää myös EtsittavaTeksti").unwrap();
 
-        // With zero TTL, it should immediately be expired
-        let expired =
-            cache.get_snapshot_with_ttl(&temp_dir, &opts, std::time::Duration::from_millis(0));
-        assert!(expired.is_none());
+        // Second search must discover the new file IMMEDIATELY without blind spots or snapshot delays
+        hits.lock().unwrap().clear();
+        let h = hits.clone();
+        let stats2 = search_directory(
+            &opts,
+            &cache,
+            None,
+            move |r| h.lock().unwrap().push(r),
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(stats2.total_count, 2, "Both files must be found immediately");
+        assert_eq!(hits.lock().unwrap().len(), 2, "Newly added file must produce match immediately");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]
-    fn test_deleted_and_modified_files_in_snapshot_window() {
+    fn test_date_filter_strictly_uses_live_modified() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("doxsearch_live_date_unique_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let file1 = temp_dir.join("file1.txt");
+        std::fs::write(&file1, "Sisältö Hakusana").unwrap();
+
+        let cache = DocumentCache::new();
+        let future_time = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let past_time = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+
+        let opts_future = SearchOptions {
+            directory: temp_dir.clone(),
+            query: "Hakusana".to_string(),
+            modified_after: Some(future_time),
+            ..Default::default()
+        };
+
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let h = hits.clone();
+        let _ = search_directory(
+            &opts_future,
+            &cache,
+            None,
+            move |r| h.lock().unwrap().push(r),
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(hits.lock().unwrap().len(), 0, "Future modified_after must exclude current file");
+
+        let opts_past = SearchOptions {
+            directory: temp_dir.clone(),
+            query: "Hakusana".to_string(),
+            modified_after: Some(past_time),
+            ..Default::default()
+        };
+        hits.lock().unwrap().clear();
+        let h = hits.clone();
+        let _ = search_directory(
+            &opts_past,
+            &cache,
+            None,
+            move |r| h.lock().unwrap().push(r),
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(hits.lock().unwrap().len(), 1, "Past modified_after must include current file");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_deleted_and_modified_files_in_repeated_searches() {
         let temp_dir =
             std::env::temp_dir().join(format!("doxsearch_del_mod_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&temp_dir);
@@ -2851,7 +2832,7 @@ mod tests {
             ..Default::default()
         };
 
-        // 1. Initial search caches snapshot and contents
+        // 1. Initial search caches contents
         let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let h = hits.clone();
         let stats1 = search_directory(
@@ -2866,7 +2847,7 @@ mod tests {
         assert_eq!(stats1.total_count, 2);
         assert_eq!(hits.lock().unwrap().len(), 2);
 
-        // 2. Delete file2: snapshot still has file2, but process_candidate must ignore it because it's deleted!
+        // 2. Delete file2
         let _ = std::fs::remove_file(&file2);
 
         // 3. Modify file1 with new content
@@ -2922,7 +2903,7 @@ mod tests {
         assert_eq!(
             hits.lock().unwrap().len(),
             0,
-            "Deleted file must not produce match even within snapshot"
+            "Deleted file must not produce match"
         );
 
         // 6. Search for updated keyword "AvainsanaPaivitetty" -> must match file1
