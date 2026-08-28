@@ -1004,27 +1004,31 @@ impl DoXsearchApp {
         }
     }
 
-    fn open_in_file_manager_async(&self, path: &Path) {
+    fn open_in_file_manager_async(&self, path: &Path, ctx: &egui::Context) {
         let path = path.to_path_buf();
         let tx = self.tx.clone();
+        let ctx = ctx.clone();
         thread::Builder::new()
             .name("show-in-fm".to_string())
             .spawn(move || {
                 if let Err(e) = show_in_file_manager(&path) {
                     let _ = tx.send(SearchMessage::UiError(e));
+                    ctx.request_repaint();
                 }
             })
             .ok();
     }
 
-    fn open_file_async(&self, path: &Path) {
+    fn open_file_async(&self, path: &Path, ctx: &egui::Context) {
         let path = path.to_path_buf();
         let tx = self.tx.clone();
+        let ctx = ctx.clone();
         thread::Builder::new()
             .name("open-file".to_string())
             .spawn(move || {
                 if let Err(e) = open::that(&path) {
-                    let _ = tx.send(SearchMessage::UiError(format!("Failed to open file: {e}")));
+                    let _ = tx.send(SearchMessage::UiError(format!("Failed to open file: {}", e)));
+                    ctx.request_repaint();
                 }
             })
             .ok();
@@ -1620,7 +1624,7 @@ impl eframe::App for DoXsearchApp {
                                         .small_button(RichText::new(open_btn_label).color(BLUE_MED))
                                         .clicked()
                                     {
-                                        self.open_file_async(&result.file);
+                                        self.open_file_async(&result.file, ui.ctx());
                                     }
                                     let fm_tooltip = if self.lang == AppLanguage::Finnish {
                                         format!("Näytä: {}", os_file_manager_name(self.lang))
@@ -1634,7 +1638,7 @@ impl eframe::App for DoXsearchApp {
                                         .on_hover_text(fm_tooltip)
                                         .clicked()
                                     {
-                                        self.open_in_file_manager_async(&result.file);
+                                        self.open_in_file_manager_async(&result.file, ui.ctx());
                                     }
                                     if ui
                                         .small_button(
@@ -1711,7 +1715,7 @@ impl eframe::App for DoXsearchApp {
                 if ui.button(
                     RichText::new(open_file_text).color(Color32::WHITE)
                 ).clicked() {
-                    self.open_file_async(&result.file);
+                    self.open_file_async(&result.file, ui.ctx());
                 }
                 let show_fm_text = if self.lang == AppLanguage::Finnish {
                     format!("Näytä: {}", os_file_manager_name(self.lang))
@@ -1721,7 +1725,7 @@ impl eframe::App for DoXsearchApp {
                 if ui.button(
                     RichText::new(show_fm_text).color(TEXT_DARK)
                 ).clicked() {
-                    self.open_in_file_manager_async(&result.file);
+                    self.open_in_file_manager_async(&result.file, ui.ctx());
                 }
                 let copy_path_text = if self.lang == AppLanguage::Finnish { "Kopioi polku" } else { "Copy Path" };
                 if ui.button(
