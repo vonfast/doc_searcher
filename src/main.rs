@@ -398,7 +398,7 @@ pub fn save_file_dialog(default_name: &str, filter_ext: &str) -> Option<PathBuf>
 
 #[cfg(target_os = "linux")]
 thread_local! {
-    static DBUS_FM_IN_FLIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FILE_MANAGER_REQUEST_IN_FLIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(target_os = "linux")]
@@ -406,14 +406,14 @@ struct InFlightGuard;
 
 #[cfg(target_os = "linux")]
 impl InFlightGuard {
+    /// Serializes the entire Linux file-manager launch path per thread so a slow D-Bus call
+    /// cannot trigger overlapping CLI fallbacks from repeated clicks.
     fn try_acquire() -> Option<Self> {
-        DBUS_FM_IN_FLIGHT.with(|flag| {
-            (!flag.replace(true)).then_some(Self)
-        })
+        FILE_MANAGER_REQUEST_IN_FLIGHT.with(|flag| (!flag.replace(true)).then_some(Self))
     }
 
     fn release(&self) {
-        DBUS_FM_IN_FLIGHT.with(|flag| flag.set(false));
+        FILE_MANAGER_REQUEST_IN_FLIGHT.with(|flag| flag.set(false));
     }
 }
 
@@ -434,7 +434,8 @@ enum DbusFmOutcome {
 /// Sends a lightweight D-Bus IPC request to `org.freedesktop.FileManager1`.
 ///
 /// Note on cancellation and duplicate windows:
-/// - `DBUS_FM_IN_FLIGHT` guarantees at most one D-Bus worker thread runs concurrently.
+/// - The enclosing file-manager call holds the in-flight guard for the whole operation, so the
+///   D-Bus path and any CLI fallback are serialized together.
 /// - If D-Bus is unavailable (e.g. no session bus or no FileManager1 service), it fails immediately
 ///   and safely triggers the CLI fallback.
 /// - If D-Bus times out (busy or slow daemon), we do NOT trigger the CLI fallback to prevent opening
@@ -442,15 +443,6 @@ enum DbusFmOutcome {
 #[cfg(target_os = "linux")]
 fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> DbusFmOutcome {
     use std::sync::atomic::{AtomicBool, Ordering};
-
-    let in_flight = match InFlightGuard::try_acquire() {
-        Some(guard) => guard,
-        None => {
-            return DbusFmOutcome::TimedOutOrBusy(
-                "D-Bus FileManager1 call already in progress".to_string(),
-            );
-        }
-    };
 
     let (done_tx, done_rx) = crossbeam_channel::bounded(1);
     let uri_str = uri.to_string();
@@ -510,11 +502,10 @@ fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> DbusFmOutcome {
         });
 
     if let Err(e) = spawn_res {
-        drop(in_flight);
         return DbusFmOutcome::Unavailable(format!("Failed to spawn D-Bus thread: {e}"));
     }
 
-    let outcome = match done_rx.recv_timeout(std::time::Duration::from_millis(1500)) {
+    match done_rx.recv_timeout(std::time::Duration::from_millis(1500)) {
         Ok(Ok(())) => DbusFmOutcome::Success,
         Ok(Err(e)) => DbusFmOutcome::Unavailable(e),
         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -525,16 +516,26 @@ fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> DbusFmOutcome {
             cancelled.store(true, Ordering::SeqCst);
             DbusFmOutcome::Unavailable("D-Bus thread disconnected unexpectedly".to_string())
         }
-    };
-
-    drop(in_flight);
-    outcome
+    }
 }
 
 pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
     if !path.exists() {
         return Err(format!("Path does not exist: {}", path.display()));
     }
+
+    #[cfg(target_os = "linux")]
+    let _in_flight = match InFlightGuard::try_acquire() {
+        Some(guard) => guard,
+        None => {
+            #[cfg(debug_assertions)]
+            eprintln!("[DoXsearch] File manager request already in flight; skipping duplicate launch.");
+            return Ok(());
+        }
+    };
+
+    // One file-manager request per thread at a time: this serializes both the D-Bus path and
+    // any CLI fallback so repeated clicks do not spawn multiple file-manager windows.
 
     #[cfg(target_os = "windows")]
     {
@@ -2231,7 +2232,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn test_dbus_in_flight_flag_is_thread_local() {
+    fn test_file_manager_request_guard_is_thread_local() {
         let guard = InFlightGuard::try_acquire().expect("main thread should acquire once");
         assert!(
             InFlightGuard::try_acquire().is_none(),
