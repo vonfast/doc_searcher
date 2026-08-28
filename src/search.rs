@@ -6,6 +6,7 @@ use quick_xml::reader::Reader;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use zip::ZipArchive;
 
@@ -131,9 +132,17 @@ impl DirectorySnapshot {
     }
 }
 
+static GLOBAL_CACHE_TICK: AtomicU64 = AtomicU64::new(1);
+
+struct CacheEntry {
+    text: Arc<str>,
+    size: usize,
+    last_accessed: AtomicU64,
+}
+
 #[derive(Default)]
 struct CacheShard {
-    entries: HashMap<CacheKey, Arc<str>>,
+    entries: HashMap<CacheKey, CacheEntry>,
     total_bytes: usize,
 }
 
@@ -144,7 +153,13 @@ impl CacheShard {
     }
 
     fn get(&self, key: &CacheKey) -> Option<Arc<str>> {
-        self.entries.get(key).cloned()
+        if let Some(entry) = self.entries.get(key) {
+            let tick = GLOBAL_CACHE_TICK.fetch_add(1, Ordering::Relaxed);
+            entry.last_accessed.store(tick, Ordering::Relaxed);
+            Some(Arc::clone(&entry.text))
+        } else {
+            None
+        }
     }
 
     fn insert(&mut self, key: CacheKey, text: Arc<str>) {
@@ -156,30 +171,60 @@ impl CacheShard {
 
         // If key already existed, subtract old size first
         if let Some(old_val) = self.entries.remove(&key) {
-            let old_size = Self::entry_size(&key, &old_val);
-            self.total_bytes = self.total_bytes.saturating_sub(old_size);
+            self.total_bytes = self.total_bytes.saturating_sub(old_val.size);
         }
 
-        // If exceeding max entries or total bytes in this shard, prune down by 20% (keep 80%)
+        // If exceeding max entries or total bytes in this shard, prune down to 80% using LRU order
         if self.entries.len() >= MAX_SHARD_ENTRIES
             || self.total_bytes + new_entry_size > MAX_SHARD_BYTES
         {
             let target_bytes = (MAX_SHARD_BYTES * 8) / 10;
             let target_entries = (MAX_SHARD_ENTRIES * 8) / 10;
-            let keys_to_remove: Vec<CacheKey> = self.entries.keys().cloned().collect();
+
+            let bytes_to_free = (self.total_bytes + new_entry_size).saturating_sub(target_bytes);
+            let entries_to_free = (self.entries.len() + 1).saturating_sub(target_entries);
+
+            // Collect candidate references without cloning all CacheKey objects
+            let mut candidates: Vec<(&CacheKey, u64, usize)> = self
+                .entries
+                .iter()
+                .map(|(k, v)| (k, v.last_accessed.load(Ordering::Relaxed), v.size))
+                .collect();
+
+            // Sort by last_accessed ascending (oldest / least recently used first)
+            candidates.sort_unstable_by_key(|c| c.1);
+
+            let mut freed_bytes = 0;
+            let mut freed_entries = 0;
+            let mut keys_to_remove = Vec::new();
+
+            for (k, _, sz) in candidates {
+                if freed_bytes < bytes_to_free || freed_entries < entries_to_free {
+                    keys_to_remove.push((*k).clone());
+                    freed_bytes = freed_bytes.saturating_add(sz);
+                    freed_entries += 1;
+                } else {
+                    break;
+                }
+            }
+
             for k in keys_to_remove {
                 if let Some(v) = self.entries.remove(&k) {
-                    let rem_size = Self::entry_size(&k, &v);
-                    self.total_bytes = self.total_bytes.saturating_sub(rem_size);
-                }
-                if self.total_bytes <= target_bytes && self.entries.len() <= target_entries {
-                    break;
+                    self.total_bytes = self.total_bytes.saturating_sub(v.size);
                 }
             }
         }
 
+        let tick = GLOBAL_CACHE_TICK.fetch_add(1, Ordering::Relaxed);
         self.total_bytes = self.total_bytes.saturating_add(new_entry_size);
-        self.entries.insert(key, text);
+        self.entries.insert(
+            key,
+            CacheEntry {
+                text,
+                size: new_entry_size,
+                last_accessed: AtomicU64::new(tick),
+            },
+        );
     }
 
     fn clear(&mut self) {
@@ -509,6 +554,7 @@ pub fn scan_candidates(
     candidates
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_candidate(
     candidate: &SearchCandidate,
     opts: &SearchOptions,
@@ -683,6 +729,7 @@ pub fn search_directory(
         );
 
         let current = processed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        #[allow(clippy::manual_is_multiple_of)]
         if current % step == 0 || current == total {
             progress_cb(current, total);
         }
@@ -767,6 +814,103 @@ pub fn extract_plain_text(path: &Path) -> Result<String> {
     Ok(sanitized)
 }
 
+/// Unescapes XML text directly into the provided output String buffer without per-node heap allocations.
+pub fn unescape_xml_into(raw: &[u8], out: &mut String) {
+    if !raw.contains(&b'&') {
+        // Fast path: No escape entities present (common for >95% of text nodes)
+        if let Ok(s) = std::str::from_utf8(raw) {
+            out.push_str(s);
+        } else {
+            out.push_str(&String::from_utf8_lossy(raw));
+        }
+        return;
+    }
+
+    // Escape entities exist: decode directly into `out` without allocating temporary strings
+    let mut cursor = 0;
+    while cursor < raw.len() {
+        if let Some(pos) = raw[cursor..].iter().position(|&b| b == b'&') {
+            let amp_pos = cursor + pos;
+            // Push text before '&'
+            if amp_pos > cursor {
+                if let Ok(s) = std::str::from_utf8(&raw[cursor..amp_pos]) {
+                    out.push_str(s);
+                } else {
+                    out.push_str(&String::from_utf8_lossy(&raw[cursor..amp_pos]));
+                }
+            }
+
+            // Find ending ';' for entity, up to 16 bytes (e.g. &#x10FFFF;)
+            let entity_search_slice = &raw[amp_pos + 1..raw.len().min(amp_pos + 16)];
+            if let Some(semi_offset) = entity_search_slice.iter().position(|&b| b == b';') {
+                let entity_bytes = &raw[amp_pos + 1..amp_pos + 1 + semi_offset];
+                match entity_bytes {
+                    b"amp" => out.push('&'),
+                    b"lt" => out.push('<'),
+                    b"gt" => out.push('>'),
+                    b"quot" => out.push('"'),
+                    b"apos" => out.push('\''),
+                    _ if entity_bytes.starts_with(b"#x") || entity_bytes.starts_with(b"#X") => {
+                        if let Ok(hex_str) = std::str::from_utf8(&entity_bytes[2..]) {
+                            if let Ok(code) = u32::from_str_radix(hex_str, 16) {
+                                if let Some(ch) = char::from_u32(code) {
+                                    out.push(ch);
+                                } else {
+                                    out.push('\u{FFFD}');
+                                }
+                            } else {
+                                out.push('&');
+                                if let Ok(s) = std::str::from_utf8(entity_bytes) {
+                                    out.push_str(s);
+                                }
+                                out.push(';');
+                            }
+                        }
+                    }
+                    _ if entity_bytes.starts_with(b"#") => {
+                        if let Ok(dec_str) = std::str::from_utf8(&entity_bytes[1..]) {
+                            if let Ok(code) = dec_str.parse::<u32>() {
+                                if let Some(ch) = char::from_u32(code) {
+                                    out.push(ch);
+                                } else {
+                                    out.push('\u{FFFD}');
+                                }
+                            } else {
+                                out.push('&');
+                                if let Ok(s) = std::str::from_utf8(entity_bytes) {
+                                    out.push_str(s);
+                                }
+                                out.push(';');
+                            }
+                        }
+                    }
+                    _ => {
+                        // Unknown named entity: push literal
+                        out.push('&');
+                        if let Ok(s) = std::str::from_utf8(entity_bytes) {
+                            out.push_str(s);
+                        }
+                        out.push(';');
+                    }
+                }
+                cursor = amp_pos + 1 + semi_offset + 1;
+            } else {
+                // No terminating ';' found within range: push literal '&' and advance
+                out.push('&');
+                cursor = amp_pos + 1;
+            }
+        } else {
+            // Remainder of the buffer
+            if let Ok(s) = std::str::from_utf8(&raw[cursor..]) {
+                out.push_str(s);
+            } else {
+                out.push_str(&String::from_utf8_lossy(&raw[cursor..]));
+            }
+            break;
+        }
+    }
+}
+
 /// Extract text from a .docx file using streaming XML reader across all body, header, footer, footnote, endnote, and comment parts
 pub fn extract_docx(path: &Path) -> Result<String> {
     let file = std::fs::File::open(path)
@@ -819,17 +963,15 @@ pub fn extract_docx(path: &Path) -> Result<String> {
             format!("Could not read part {xml_name} in docx: {}", path.display())
         })?;
         let reader = Reader::from_reader(std::io::BufReader::new(entry));
-        let part_text = extract_text_from_xml_reader(reader, true).with_context(|| {
+        let prev_len = full_text.len();
+        extract_text_from_xml_reader_into(reader, true, &mut full_text).with_context(|| {
             format!(
                 "Error parsing XML in {xml_name} in docx: {}",
                 path.display()
             )
         })?;
-        if !part_text.trim().is_empty() {
-            if !full_text.is_empty() && !full_text.ends_with('\n') {
-                full_text.push('\n');
-            }
-            full_text.push_str(&part_text);
+        if full_text.len() > prev_len && !full_text.ends_with('\n') {
+            full_text.push('\n');
         }
     }
 
@@ -859,35 +1001,39 @@ pub fn extract_odt(path: &Path) -> Result<String> {
         .by_name("content.xml")
         .with_context(|| format!("content.xml missing from odt: {}", path.display()))?;
     let reader = Reader::from_reader(std::io::BufReader::new(doc));
-    let body_text = extract_text_from_xml_reader(reader, false)
+    extract_text_from_xml_reader_into(reader, false, &mut full_text)
         .with_context(|| format!("Error reading content.xml in odt: {}", path.display()))?;
-    full_text.push_str(&body_text);
 
     // 2. styles.xml (contains headers and footers in ODT)
     if let Ok(styles) = archive.by_name("styles.xml") {
-        let reader = Reader::from_reader(std::io::BufReader::new(styles));
-        let style_text = extract_text_from_xml_reader(reader, false)
-            .with_context(|| format!("Error reading styles.xml in odt: {}", path.display()))?;
-        if !style_text.trim().is_empty() {
-            if !full_text.is_empty() && !full_text.ends_with('\n') {
-                full_text.push('\n');
-            }
-            full_text.push_str(&style_text);
+        if !full_text.is_empty() && !full_text.ends_with('\n') {
+            full_text.push('\n');
         }
+        let reader = Reader::from_reader(std::io::BufReader::new(styles));
+        let _ = extract_text_from_xml_reader_into(reader, false, &mut full_text);
     }
 
     Ok(full_text)
 }
 
 pub fn extract_text_from_xml_reader<R: std::io::BufRead>(
-    mut reader: Reader<R>,
+    reader: Reader<R>,
     is_docx: bool,
 ) -> Result<String> {
+    let mut text_content = String::with_capacity(4096);
+    extract_text_from_xml_reader_into(reader, is_docx, &mut text_content)?;
+    Ok(text_content)
+}
+
+pub fn extract_text_from_xml_reader_into<R: std::io::BufRead>(
+    mut reader: Reader<R>,
+    is_docx: bool,
+    text_content: &mut String,
+) -> Result<()> {
     reader.trim_text(false);
     reader.check_end_names(true);
 
-    let mut text_content = String::with_capacity(4096);
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(512);
 
     let mut in_text_node = false;
     let mut in_paragraph = false;
@@ -912,8 +1058,7 @@ pub fn extract_text_from_xml_reader<R: std::io::BufRead>(
                 };
 
                 if should_extract {
-                    let text = e.unescape().unwrap_or_default();
-                    text_content.push_str(&text);
+                    unescape_xml_into(e.as_ref(), text_content);
                 }
             }
             Ok(Event::CData(e)) => {
@@ -926,6 +1071,8 @@ pub fn extract_text_from_xml_reader<R: std::io::BufRead>(
                 if should_extract {
                     if let Ok(text) = std::str::from_utf8(e.as_ref()) {
                         text_content.push_str(text);
+                    } else {
+                        text_content.push_str(&String::from_utf8_lossy(e.as_ref()));
                     }
                 }
             }
@@ -952,6 +1099,7 @@ pub fn extract_text_from_xml_reader<R: std::io::BufRead>(
                                     std::str::from_utf8(&a.value).ok()?.parse::<usize>().ok()
                                 })
                                 .unwrap_or(1);
+                            text_content.reserve(count);
                             for _ in 0..count {
                                 text_content.push(' ');
                             }
@@ -980,7 +1128,7 @@ pub fn extract_text_from_xml_reader<R: std::io::BufRead>(
         buf.clear();
     }
 
-    Ok(text_content)
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -2515,5 +2663,66 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
+
+    #[test]
+    fn test_cache_lru_eviction_order() {
+        let cache = DocumentCache::new();
+        // Insert a key and access it repeatedly to keep it hot
+        let hot_key = CacheKey {
+            path: PathBuf::from("/tmp/hot_doc.docx"),
+            size: 100,
+            modified: None,
+        };
+        cache.insert(hot_key.clone(), "Hot content".into());
+
+        // Insert many keys into the same shard to trigger eviction
+        let shard_idx = DocumentCache::shard_index(&hot_key);
+        for i in 0..1000 {
+            let key = CacheKey {
+                path: PathBuf::from(format!("/tmp/doc_{}_{}.docx", shard_idx, i)),
+                size: 100,
+                modified: None,
+            };
+            if DocumentCache::shard_index(&key) == shard_idx {
+                cache.insert(key, format!("Content {}", i).into());
+                // Touch the hot key periodically so its last_accessed tick is updated
+                let _ = cache.get(&hot_key);
+            }
+        }
+
+        // Hot key should still be present because it was accessed recently (LRU)
+        assert!(
+            cache.get(&hot_key).is_some(),
+            "Frequently accessed hot key should be preserved by LRU eviction"
+        );
+    }
+
+    #[test]
+    fn test_unescape_xml_into_entities_and_numeric() {
+        let mut out = String::new();
+
+        // 1. Fast path without escape entities
+        unescape_xml_into(b"Simple plain text without escapes", &mut out);
+        assert_eq!(out, "Simple plain text without escapes");
+
+        // 2. Standard XML entities
+        out.clear();
+        unescape_xml_into(
+            b"Alpha &amp; Beta &lt; Gamma &gt; Delta &quot; Epsilon &apos; Zeta",
+            &mut out,
+        );
+        assert_eq!(out, "Alpha & Beta < Gamma > Delta \" Epsilon ' Zeta");
+
+        // 3. Hexadecimal and decimal numeric character references
+        out.clear();
+        unescape_xml_into(b"Price: 100 &#x20AC; or &#8364; (Letter: &#x41; / &#65;)", &mut out);
+        assert_eq!(out, "Price: 100 € or € (Letter: A / A)");
+
+        // 4. Malformed entities and standalone ampersands
+        out.clear();
+        unescape_xml_into(b"Rock & Roll &unknown; &amp; End", &mut out);
+        assert_eq!(out, "Rock & Roll &unknown; & End");
+    }
 }
+
 
