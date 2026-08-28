@@ -88,6 +88,7 @@ pub const MAX_CACHED_ENTRY_BYTES: usize = 5 * 1024 * 1024; // 5 MB per file
 pub const MAX_CACHE_ENTRIES: usize = 10_000;
 const MAX_SHARD_BYTES: usize = MAX_CACHE_TOTAL_BYTES / NUM_SHARDS;
 const MAX_SHARD_ENTRIES: usize = MAX_CACHE_ENTRIES / NUM_SHARDS;
+pub const SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub fn clean_path(p: PathBuf) -> PathBuf {
     let s = p.to_string_lossy();
@@ -102,6 +103,7 @@ pub fn clean_path(p: PathBuf) -> PathBuf {
 pub struct SearchCandidate {
     pub path: PathBuf,
     pub ext: String,
+    #[allow(dead_code)]
     pub size: u64,
     pub modified: Option<std::time::SystemTime>,
 }
@@ -109,7 +111,6 @@ pub struct SearchCandidate {
 #[derive(Clone, Debug)]
 pub struct DirectorySnapshot {
     pub candidates: Vec<SearchCandidate>,
-    #[allow(dead_code)]
     pub created_at: std::time::Instant,
     pub recursive: bool,
     pub search_hidden: bool,
@@ -129,6 +130,10 @@ impl DirectorySnapshot {
             && self.search_pdf == opts.search_pdf
             && self.search_txt == opts.search_txt
             && self.max_file_size_mb == opts.max_file_size_mb
+    }
+
+    pub fn is_expired(&self, ttl: std::time::Duration) -> bool {
+        self.created_at.elapsed() >= ttl
     }
 }
 
@@ -292,9 +297,18 @@ impl DocumentCache {
     }
 
     pub fn get_snapshot(&self, dir: &Path, opts: &SearchOptions) -> Option<Vec<SearchCandidate>> {
+        self.get_snapshot_with_ttl(dir, opts, SNAPSHOT_TTL)
+    }
+
+    pub fn get_snapshot_with_ttl(
+        &self,
+        dir: &Path,
+        opts: &SearchOptions,
+        ttl: std::time::Duration,
+    ) -> Option<Vec<SearchCandidate>> {
         let guard = self.dir_snapshots.read().ok()?;
         let snap = guard.get(dir)?;
-        if snap.matches_opts(opts) {
+        if snap.matches_opts(opts) && !snap.is_expired(ttl) {
             Some(snap.candidates.clone())
         } else {
             None
@@ -571,10 +585,19 @@ fn process_candidate(
         }
     }
 
+    // Verify that the file actually exists on disk before processing or checking cache.
+    // If deleted since candidate scanning / snapshot, ignore it cleanly.
+    let meta = match std::fs::metadata(&candidate.path) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    let current_size = meta.len();
+    let current_modified = meta.modified().ok();
+
     let cache_key = CacheKey {
         path: candidate.path.clone(),
-        size: candidate.size,
-        modified: candidate.modified,
+        size: current_size,
+        modified: current_modified,
     };
 
     let text_result: Result<Arc<str>> = if opts.use_cache {
@@ -582,7 +605,7 @@ fn process_candidate(
             cached_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(cached)
         } else {
-            let is_heavy = candidate.ext == "pdf" || candidate.size >= HEAVY_FILE_SIZE_THRESHOLD;
+            let is_heavy = candidate.ext == "pdf" || current_size >= HEAVY_FILE_SIZE_THRESHOLD;
             let _permit = if is_heavy {
                 match heavy_semaphore.acquire_cancellable(is_cancelled) {
                     Some(p) => Some(p),
@@ -610,7 +633,7 @@ fn process_candidate(
             }
         }
     } else {
-        let is_heavy = candidate.ext == "pdf" || candidate.size >= HEAVY_FILE_SIZE_THRESHOLD;
+        let is_heavy = candidate.ext == "pdf" || current_size >= HEAVY_FILE_SIZE_THRESHOLD;
         let _permit = if is_heavy {
             match heavy_semaphore.acquire_cancellable(is_cancelled) {
                 Some(p) => Some(p),
@@ -648,7 +671,7 @@ fn process_candidate(
                     file: candidate.path.clone(),
                     file_type: display_type,
                     matches,
-                    modified: candidate.modified,
+                    modified: current_modified,
                 });
             }
         }
@@ -2773,6 +2796,160 @@ mod tests {
         let _ = std::fs::remove_file(&docx_path);
         let _ = std::fs::remove_file(&odt_path);
         let _ = std::fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_directory_snapshot_ttl_expiration() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("doxsearch_ttl_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let cache = DocumentCache::new();
+        let opts = SearchOptions {
+            directory: temp_dir.clone(),
+            ..Default::default()
+        };
+
+        let candidate = SearchCandidate {
+            path: temp_dir.join("a.txt"),
+            ext: "txt".to_string(),
+            size: 10,
+            modified: None,
+        };
+        cache.store_snapshot(temp_dir.clone(), &opts, vec![candidate]);
+
+        // Fresh snapshot should be returned
+        let fresh = cache.get_snapshot(&temp_dir, &opts);
+        assert!(fresh.is_some());
+        assert_eq!(fresh.unwrap().len(), 1);
+
+        // With zero TTL, it should immediately be expired
+        let expired =
+            cache.get_snapshot_with_ttl(&temp_dir, &opts, std::time::Duration::from_millis(0));
+        assert!(expired.is_none());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_deleted_and_modified_files_in_snapshot_window() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("doxsearch_del_mod_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let file1 = temp_dir.join("file1.txt");
+        let file2 = temp_dir.join("file2.txt");
+
+        std::fs::write(&file1, "TiedostoYksi sisältää AvainsanaAlkuperainen").unwrap();
+        std::fs::write(&file2, "TiedostoKaksi sisältää AvainsanaKaksi").unwrap();
+
+        let cache = DocumentCache::new();
+        let opts = SearchOptions {
+            directory: temp_dir.clone(),
+            query: "Avainsana".to_string(),
+            use_cache: true,
+            ..Default::default()
+        };
+
+        // 1. Initial search caches snapshot and contents
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let h = hits.clone();
+        let stats1 = search_directory(
+            &opts,
+            &cache,
+            None,
+            move |r| h.lock().unwrap().push(r),
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(stats1.total_count, 2);
+        assert_eq!(hits.lock().unwrap().len(), 2);
+
+        // 2. Delete file2: snapshot still has file2, but process_candidate must ignore it because it's deleted!
+        let _ = std::fs::remove_file(&file2);
+
+        // 3. Modify file1 with new content
+        std::thread::sleep(std::time::Duration::from_millis(10)); // Ensure modified time tick differs
+        std::fs::write(
+            &file1,
+            "TiedostoYksi on nyt päivitetty: AvainsanaPaivitetty",
+        )
+        .unwrap();
+
+        // 4. Search for original keyword "AvainsanaAlkuperainen" -> must NOT match because file1 was modified
+        hits.lock().unwrap().clear();
+        let h = hits.clone();
+        let opts_old = SearchOptions {
+            directory: temp_dir.clone(),
+            query: "AvainsanaAlkuperainen".to_string(),
+            use_cache: true,
+            ..Default::default()
+        };
+        let _ = search_directory(
+            &opts_old,
+            &cache,
+            None,
+            move |r| h.lock().unwrap().push(r),
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(
+            hits.lock().unwrap().len(),
+            0,
+            "Modified file must not hit stale cached content"
+        );
+
+        // 5. Search for "AvainsanaKaksi" -> must NOT match because file2 was deleted
+        hits.lock().unwrap().clear();
+        let h = hits.clone();
+        let opts_del = SearchOptions {
+            directory: temp_dir.clone(),
+            query: "AvainsanaKaksi".to_string(),
+            use_cache: true,
+            ..Default::default()
+        };
+        let _ = search_directory(
+            &opts_del,
+            &cache,
+            None,
+            move |r| h.lock().unwrap().push(r),
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(
+            hits.lock().unwrap().len(),
+            0,
+            "Deleted file must not produce match even within snapshot"
+        );
+
+        // 6. Search for updated keyword "AvainsanaPaivitetty" -> must match file1
+        hits.lock().unwrap().clear();
+        let h = hits.clone();
+        let opts_new = SearchOptions {
+            directory: temp_dir.clone(),
+            query: "AvainsanaPaivitetty".to_string(),
+            use_cache: true,
+            ..Default::default()
+        };
+        let _ = search_directory(
+            &opts_new,
+            &cache,
+            None,
+            move |r| h.lock().unwrap().push(r),
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(
+            hits.lock().unwrap().len(),
+            1,
+            "Modified file must be parsed and found"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
 
