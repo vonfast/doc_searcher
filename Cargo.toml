@@ -24,8 +24,8 @@ pdf-extract = "0.7"
 quick-xml = "0.31"
 # Rinnakkainen hakemistoläpikäynti
 jwalk = "0.8"
-# Tiedostovalitsin
-rfd = { version = "0.14", default-features = false, features = ["gtk3"] }
+# Tiedostovalitsin XDG Desktop Portal -tuella (D-Bus / ashpd)
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
 # Virheenkäsittely
 anyhow = "1"
 # Tiedostojen avaaminen

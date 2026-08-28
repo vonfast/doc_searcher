@@ -58,7 +58,7 @@ Ensure you have the Rust toolchain installed (`rustup`).
 sudo apt-get update
 sudo apt-get install -y \
     libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev \
-    libgtk-3-dev pkg-config libfontconfig1-dev zenity
+    libgtk-3-dev pkg-config libfontconfig1-dev
 ```
 
 #### Build and Run

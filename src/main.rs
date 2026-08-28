@@ -391,31 +391,6 @@ pub fn get_user_downloads_dir() -> PathBuf {
 }
 
 pub fn pick_folder_dialog(start_dir: Option<&std::path::Path>) -> Option<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        if detect_linux_file_manager() == LinuxFileManager::Dolphin {
-            let start = start_dir
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| get_user_documents_dir().to_string_lossy().to_string());
-            if let Ok(out) = std::process::Command::new("kdialog")
-                .args(["--getexistingdirectory", &start])
-                .output()
-            {
-                if out.status.success() {
-                    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if !s.is_empty() {
-                        let p = PathBuf::from(&s);
-                        if p.exists() {
-                            return Some(p);
-                        }
-                    }
-                }
-                // kdialog was executed. If user cancelled (exit code 1) or returned empty, do not show a second dialog.
-                return None;
-            }
-        }
-    }
-
     let mut dialog = rfd::FileDialog::new();
     if let Some(dir) = start_dir {
         dialog = dialog.set_directory(dir);
@@ -424,30 +399,6 @@ pub fn pick_folder_dialog(start_dir: Option<&std::path::Path>) -> Option<PathBuf
 }
 
 pub fn save_file_dialog(default_name: &str, filter_ext: &str) -> Option<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        if detect_linux_file_manager() == LinuxFileManager::Dolphin {
-            let start = get_user_documents_dir().join(default_name);
-            if let Ok(out) = std::process::Command::new("kdialog")
-                .args([
-                    "--getsavefilename",
-                    &start.to_string_lossy(),
-                    &format!("*.{filter_ext}"),
-                ])
-                .output()
-            {
-                if out.status.success() {
-                    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                    if !s.is_empty() {
-                        return Some(PathBuf::from(&s));
-                    }
-                }
-                // kdialog was executed. If user cancelled (exit code 1) or returned empty, do not show a second dialog.
-                return None;
-            }
-        }
-    }
-
     rfd::FileDialog::new()
         .set_file_name(default_name)
         .add_filter("CSV files", &[filter_ext])
