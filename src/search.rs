@@ -2592,33 +2592,64 @@ mod tests {
     #[test]
     fn test_cache_lru_eviction_order() {
         let cache = DocumentCache::new();
-        // Insert a key and access it repeatedly to keep it hot
-        let hot_key = CacheKey {
-            path: PathBuf::from("/tmp/hot_doc.docx"),
-            size: 100,
-            modified: None,
-        };
-        cache.insert(hot_key.clone(), "Hot content".into());
 
-        // Insert many keys into the same shard to trigger eviction
-        let shard_idx = DocumentCache::shard_index(&hot_key);
-        for i in 0..1000 {
-            let key = CacheKey {
-                path: PathBuf::from(format!("/tmp/doc_{}_{}.docx", shard_idx, i)),
+        // 1. Create a cold key and a hot key in shard 0
+        let mut cold_key = None;
+        let mut hot_key = None;
+
+        for i in 0..100_000 {
+            let k = CacheKey {
+                path: PathBuf::from(format!("/tmp/doc_shard0_{}.txt", i)),
                 size: 100,
                 modified: None,
             };
-            if DocumentCache::shard_index(&key) == shard_idx {
-                cache.insert(key, format!("Content {}", i).into());
-                // Touch the hot key periodically so its last_accessed tick is updated
+            if DocumentCache::shard_index(&k) == 0 {
+                if cold_key.is_none() {
+                    cold_key = Some(k);
+                } else if hot_key.is_none() {
+                    hot_key = Some(k);
+                    break;
+                }
+            }
+        }
+
+        let cold_key = cold_key.expect("Found cold key");
+        let hot_key = hot_key.expect("Found hot key");
+
+        // Insert cold key (will not be accessed again)
+        cache.insert(cold_key.clone(), "Cold content".into());
+
+        // Insert hot key
+        cache.insert(hot_key.clone(), "Hot content".into());
+
+        // 2. Generate and insert 700+ keys mapping specifically to shard 0 to exceed MAX_SHARD_ENTRIES (625)
+        let mut inserted_same_shard = 0;
+        let mut i = 1000;
+        while inserted_same_shard < MAX_SHARD_ENTRIES + 100 {
+            let key = CacheKey {
+                path: PathBuf::from(format!("/tmp/doc_filler_{}.txt", i)),
+                size: 100,
+                modified: None,
+            };
+            i += 1;
+            if DocumentCache::shard_index(&key) == 0 {
+                cache.insert(key, format!("Filler {}", i).into());
+                inserted_same_shard += 1;
+                // Keep hot_key fresh by touching it on every iteration
                 let _ = cache.get(&hot_key);
             }
         }
 
-        // Hot key should still be present because it was accessed recently (LRU)
+        // 3. Verify LRU eviction results:
+        // - Cold key must be evicted because it was never touched after insertion
+        assert!(
+            cache.get(&cold_key).is_none(),
+            "Untouched cold key must be evicted when shard exceeds capacity"
+        );
+        // - Hot key must still be present because it was kept fresh via recent gets
         assert!(
             cache.get(&hot_key).is_some(),
-            "Frequently accessed hot key should be preserved by LRU eviction"
+            "Frequently accessed hot key must be preserved by LRU eviction"
         );
     }
 
