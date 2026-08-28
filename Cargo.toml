@@ -22,8 +22,8 @@ zip = "0.6"
 pdf-extract = "0.7"
 # XML-parsinta
 quick-xml = "0.31"
-# Rekursiivinen hakemistoläpikäynti
-walkdir = "2"
+# Rinnakkainen hakemistoläpikäynti
+jwalk = "0.8"
 # Tiedostovalitsin
 rfd = { version = "0.14", default-features = false, features = ["gtk3"] }
 # Virheenkäsittely
@@ -34,6 +34,8 @@ open = "5.3"
 crossbeam-channel = "0.5"
 # Rinnakkaislaskenta
 rayon = "1.10"
+# Säännölliset lausekkeet ja nopea haku
+regex = "1.10"
 # Päivämäärän muotoilu
 chrono = "0.4"
 # Flate/Zlib purku vioittuneiden PDF-virtojen toipumiseen

@@ -7,7 +7,6 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use walkdir::WalkDir;
 use zip::ZipArchive;
 
 #[derive(Hash, PartialEq, Eq, Clone, Debug)]
@@ -310,109 +309,224 @@ pub struct SearchStats {
     pub duration: std::time::Duration,
 }
 
-fn scan_candidates(
+pub fn scan_candidates(
     canonical_root: &Path,
     opts: &SearchOptions,
     is_cancelled: Option<&std::sync::atomic::AtomicBool>,
 ) -> Vec<SearchCandidate> {
     let max_depth = if opts.recursive { usize::MAX } else { 1 };
-    WalkDir::new(canonical_root)
+    let search_hidden = opts.search_hidden;
+    let search_docx = opts.search_docx;
+    let search_odt = opts.search_odt;
+    let search_pdf = opts.search_pdf;
+    let search_txt = opts.search_txt;
+    let max_file_size_mb = opts.max_file_size_mb;
+
+    let walk = jwalk::WalkDirGeneric::<((), ())>::new(canonical_root)
         .max_depth(max_depth)
-        .into_iter()
-        .filter_entry(|e| {
-            if let Some(cancel) = is_cancelled {
-                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                    return false;
-                }
-            }
-            if e.depth() == 0 {
-                return true;
-            }
-            let ft = e.file_type();
-            let is_dir = ft.is_dir() || (ft.is_symlink() && e.path().is_dir());
-            let name = e.file_name().to_string_lossy();
+        .skip_hidden(false)
+        .process_read_dir(move |_depth, _path, _state, children| {
+            children.retain(|child_res| {
+                if let Ok(entry) = child_res {
+                    let ft = entry.file_type;
+                    let is_dir = ft.is_dir() || (ft.is_symlink() && entry.path().is_dir());
+                    let name = entry.file_name.to_string_lossy();
 
-            if !opts.search_hidden && name.starts_with('.') {
-                return false;
-            }
-
-            if is_dir {
-                if name == "node_modules"
-                    || name == "target"
-                    || name == "__pycache__"
-                    || name == "venv"
-                    || name == ".venv"
-                    || name == ".cargo"
-                    || name == ".rustup"
-                    || name == ".local"
-                    || name == ".cache"
-                    || name == ".var"
-                    || name == ".mozilla"
-                    || name == ".steam"
-                    || name == ".wine"
-                    || name == ".flatpak"
-                    || name == "build"
-                {
-                    return false;
-                }
-            } else {
-                let is_file = ft.is_file() || (ft.is_symlink() && e.path().is_file());
-                if is_file {
-                    let ext = e
-                        .path()
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .unwrap_or("")
-                        .to_lowercase();
-
-                    let matches_type = match ext.as_str() {
-                        "docx" | "docm" | "dotx" | "dotm" => opts.search_docx,
-                        "odt" | "ott" | "ods" | "odp" | "fodt" | "fods" => opts.search_odt,
-                        "pdf" => opts.search_pdf,
-                        "txt" | "text" => opts.search_txt,
-                        _ => false,
-                    };
-
-                    if !matches_type {
+                    if !search_hidden && name.starts_with('.') {
                         return false;
                     }
+
+                    if is_dir {
+                        if name == "node_modules"
+                            || name == "target"
+                            || name == "__pycache__"
+                            || name == "venv"
+                            || name == ".venv"
+                            || name == ".cargo"
+                            || name == ".rustup"
+                            || name == ".local"
+                            || name == ".cache"
+                            || name == ".var"
+                            || name == ".mozilla"
+                            || name == ".steam"
+                            || name == ".wine"
+                            || name == ".flatpak"
+                            || name == "build"
+                        {
+                            return false;
+                        }
+                    } else {
+                        let is_file = ft.is_file() || (ft.is_symlink() && entry.path().is_file());
+                        if is_file {
+                            let ext = std::path::Path::new(&entry.file_name)
+                                .extension()
+                                .and_then(|ext| ext.to_str())
+                                .unwrap_or("")
+                                .to_lowercase();
+
+                            let matches_type = match ext.as_str() {
+                                "docx" | "docm" | "dotx" | "dotm" => search_docx,
+                                "odt" | "ott" | "ods" | "odp" | "fodt" | "fods" => search_odt,
+                                "pdf" => search_pdf,
+                                "txt" | "text" => search_txt,
+                                _ => false,
+                            };
+
+                            if !matches_type {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                } else {
+                    false
                 }
-            }
-            true
-        })
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let ft = e.file_type();
-            if !(ft.is_file() || (ft.is_symlink() && e.path().is_file())) {
-                return None;
-            }
-            let meta_res = e.metadata().ok();
-            let path = clean_path(e.into_path());
-            let ext = path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or("")
-                .to_lowercase();
+            });
+        });
 
-            let meta = meta_res.or_else(|| std::fs::metadata(&path).ok());
-            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            let modified = meta.and_then(|m| m.modified().ok());
+    let mut candidates = Vec::new();
+    for entry_res in walk {
+        if let Some(cancel) = is_cancelled {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+        }
 
-            if let Some(max_mb) = opts.max_file_size_mb {
-                let max_bytes = max_mb.saturating_mul(1024 * 1024);
-                if size > max_bytes {
-                    return None;
+        let entry = match entry_res {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        let ft = entry.file_type;
+        if !(ft.is_file() || (ft.is_symlink() && entry.path().is_file())) {
+            continue;
+        }
+
+        let meta_res = entry.metadata().ok();
+        let path = clean_path(entry.path());
+        let ext = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        let matches_type = match ext.as_str() {
+            "docx" | "docm" | "dotx" | "dotm" => search_docx,
+            "odt" | "ott" | "ods" | "odp" | "fodt" | "fods" => search_odt,
+            "pdf" => search_pdf,
+            "txt" | "text" => search_txt,
+            _ => false,
+        };
+
+        if !matches_type {
+            continue;
+        }
+
+        let meta = meta_res.or_else(|| std::fs::metadata(&path).ok());
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let modified = meta.and_then(|m| m.modified().ok());
+
+        if let Some(max_mb) = max_file_size_mb {
+            let max_bytes = max_mb.saturating_mul(1024 * 1024);
+            if size > max_bytes {
+                continue;
+            }
+        }
+
+        candidates.push(SearchCandidate {
+            path,
+            ext,
+            size,
+            modified,
+        });
+    }
+
+    candidates
+}
+
+fn process_candidate(
+    candidate: &SearchCandidate,
+    opts: &SearchOptions,
+    cache: &DocumentCache,
+    is_cancelled: Option<&std::sync::atomic::AtomicBool>,
+    cached_hits: &std::sync::atomic::AtomicUsize,
+    on_match: &(impl Fn(SearchResult) + Sync + Send),
+    on_error: &(impl Fn(SearchError) + Sync + Send),
+) {
+    if let Some(cancel) = is_cancelled {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+    }
+
+    let cache_key = CacheKey {
+        path: candidate.path.clone(),
+        size: candidate.size,
+        modified: candidate.modified,
+    };
+
+    let text_result: Result<Arc<str>> = if opts.use_cache {
+        if let Some(cached) = cache.get(&cache_key) {
+            cached_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(cached)
+        } else {
+            let raw_res = match candidate.ext.as_str() {
+                "fodt" | "fods" => extract_flat_xml(&candidate.path),
+                "docx" | "docm" | "dotx" | "dotm" => extract_docx(&candidate.path),
+                "odt" | "ott" | "ods" | "odp" => extract_odt(&candidate.path),
+                "pdf" => extract_pdf(&candidate.path),
+                "txt" | "text" => extract_plain_text(&candidate.path),
+                _ => return,
+            };
+            match raw_res {
+                Ok(text) => {
+                    let arc_text: Arc<str> = text.into();
+                    cache.insert(cache_key, arc_text.clone());
+                    Ok(arc_text)
                 }
+                Err(e) => Err(e),
             }
+        }
+    } else {
+        match candidate.ext.as_str() {
+            "fodt" | "fods" => extract_flat_xml(&candidate.path).map(|t| t.into()),
+            "docx" | "docm" | "dotx" | "dotm" => {
+                extract_docx(&candidate.path).map(|t| t.into())
+            }
+            "odt" | "ott" | "ods" | "odp" => extract_odt(&candidate.path).map(|t| t.into()),
+            "pdf" => extract_pdf(&candidate.path).map(|t| t.into()),
+            "txt" | "text" => extract_plain_text(&candidate.path).map(|t| t.into()),
+            _ => return,
+        }
+    };
 
-            Some(SearchCandidate {
-                path,
-                ext,
-                size,
-                modified,
-            })
-        })
-        .collect()
+    match text_result {
+        Ok(text) => {
+            let matches = find_matches(&text, &opts.query, opts.ignore_case, opts.context_size);
+            if !matches.is_empty() {
+                let display_type = match candidate.ext.as_str() {
+                    "docx" | "docm" | "dotx" | "dotm" => "DOCX".to_string(),
+                    "odt" | "ott" | "ods" | "odp" => "ODT".to_string(),
+                    "fodt" | "fods" => "FODT".to_string(),
+                    "pdf" => "PDF".to_string(),
+                    "txt" | "text" => "TXT".to_string(),
+                    _ => candidate.ext.to_uppercase(),
+                };
+                on_match(SearchResult {
+                    file: candidate.path.clone(),
+                    file_type: display_type,
+                    matches,
+                    modified: candidate.modified,
+                });
+            }
+        }
+        Err(e) => {
+            on_error(SearchError {
+                file: candidate.path.clone(),
+                error: e.to_string(),
+            });
+        }
+    }
 }
 
 pub fn search_directory(
@@ -434,7 +548,12 @@ pub fn search_directory(
             cached
         } else {
             let scanned = scan_candidates(&canonical_root, opts, is_cancelled);
-            cache.store_snapshot(canonical_root.clone(), opts, scanned.clone());
+            let cancelled = is_cancelled
+                .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(false);
+            if !cancelled {
+                cache.store_snapshot(canonical_root.clone(), opts, scanned.clone());
+            }
             scanned
         }
     } else {
@@ -462,91 +581,22 @@ pub fn search_directory(
 
     let processed = std::sync::atomic::AtomicUsize::new(0);
     let cached_hits = std::sync::atomic::AtomicUsize::new(0);
-    let step = if total <= 100 {
-        1
-    } else {
-        (total / 100).max(1)
-    };
+    let step = if total <= 100 { 1 } else { (total / 100).max(1) };
 
     entries.into_par_iter().for_each(|candidate| {
-        if let Some(cancel) = is_cancelled {
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
-        }
-
-        let cache_key = CacheKey {
-            path: candidate.path.clone(),
-            size: candidate.size,
-            modified: candidate.modified,
-        };
-
-        let text_result: Result<Arc<str>> = if opts.use_cache {
-            if let Some(cached) = cache.get(&cache_key) {
-                cached_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(cached)
-            } else {
-                let raw_res = match candidate.ext.as_str() {
-                    "fodt" | "fods" => extract_flat_xml(&candidate.path),
-                    "docx" | "docm" | "dotx" | "dotm" => extract_docx(&candidate.path),
-                    "odt" | "ott" | "ods" | "odp" => extract_odt(&candidate.path),
-                    "pdf" => extract_pdf(&candidate.path),
-                    "txt" | "text" => extract_plain_text(&candidate.path),
-                    _ => return,
-                };
-                match raw_res {
-                    Ok(text) => {
-                        let arc_text: Arc<str> = text.into();
-                        cache.insert(cache_key, arc_text.clone());
-                        Ok(arc_text)
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-        } else {
-            match candidate.ext.as_str() {
-                "fodt" | "fods" => extract_flat_xml(&candidate.path).map(|t| t.into()),
-                "docx" | "docm" | "dotx" | "dotm" => {
-                    extract_docx(&candidate.path).map(|t| t.into())
-                }
-                "odt" | "ott" | "ods" | "odp" => extract_odt(&candidate.path).map(|t| t.into()),
-                "pdf" => extract_pdf(&candidate.path).map(|t| t.into()),
-                "txt" | "text" => extract_plain_text(&candidate.path).map(|t| t.into()),
-                _ => return,
-            }
-        };
+        process_candidate(
+            &candidate,
+            opts,
+            cache,
+            is_cancelled,
+            &cached_hits,
+            &on_match,
+            &on_error,
+        );
 
         let current = processed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if current.is_multiple_of(step) || current == total {
+        if current % step == 0 || current == total {
             progress_cb(current, total);
-        }
-
-        match text_result {
-            Ok(text) => {
-                let matches = find_matches(&text, &opts.query, opts.ignore_case, opts.context_size);
-                if !matches.is_empty() {
-                    let display_type = match candidate.ext.as_str() {
-                        "docx" | "docm" | "dotx" | "dotm" => "DOCX".to_string(),
-                        "odt" | "ott" | "ods" | "odp" => "ODT".to_string(),
-                        "fodt" | "fods" => "FODT".to_string(),
-                        "pdf" => "PDF".to_string(),
-                        "txt" | "text" => "TXT".to_string(),
-                        _ => candidate.ext.to_uppercase(),
-                    };
-                    on_match(SearchResult {
-                        file: candidate.path,
-                        file_type: display_type,
-                        matches,
-                        modified: candidate.modified,
-                    });
-                }
-            }
-            Err(e) => {
-                on_error(SearchError {
-                    file: candidate.path,
-                    error: e.to_string(),
-                });
-            }
         }
     });
 
@@ -1178,6 +1228,19 @@ pub fn starts_with_exact(text_slice: &str, query: &str) -> Option<usize> {
 
 pub const MAX_MATCHES_PER_FILE: usize = 200;
 
+pub fn build_search_regex(query: &str, ignore_case: bool) -> Option<regex::Regex> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = trimmed.split_whitespace().map(regex::escape).collect();
+    let pattern = parts.join(r"\s+");
+    regex::RegexBuilder::new(&pattern)
+        .case_insensitive(ignore_case)
+        .build()
+        .ok()
+}
+
 pub fn find_match_spans(text: &str, query: &str, ignore_case: bool) -> Vec<(usize, usize)> {
     find_match_spans_limit(text, query, ignore_case, None)
 }
@@ -1188,46 +1251,19 @@ pub fn find_match_spans_limit(
     ignore_case: bool,
     limit: Option<usize>,
 ) -> Vec<(usize, usize)> {
+    let re = match build_search_regex(query, ignore_case) {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
+
     let mut spans = Vec::new();
-    let trimmed_query = query.trim();
-    if trimmed_query.is_empty() {
-        return spans;
-    }
-
-    let mut char_indices = text.char_indices().peekable();
-
-    while let Some(&(start_idx, _)) = char_indices.peek() {
+    for mat in re.find_iter(text) {
         if let Some(max) = limit {
             if spans.len() >= max {
                 break;
             }
         }
-
-        let match_bytes = if ignore_case {
-            starts_with_ignore_case(&text[start_idx..], trimmed_query)
-        } else {
-            starts_with_exact(&text[start_idx..], trimmed_query)
-        };
-
-        if let Some(bytes) = match_bytes {
-            if bytes == 0 {
-                char_indices.next();
-                continue;
-            }
-            let end_idx = start_idx + bytes;
-            spans.push((start_idx, end_idx));
-
-            // Move past the match
-            while let Some(&(i, _)) = char_indices.peek() {
-                if i < end_idx {
-                    char_indices.next();
-                } else {
-                    break;
-                }
-            }
-        } else {
-            char_indices.next();
-        }
+        spans.push((mat.start(), mat.end()));
     }
 
     spans
@@ -2154,5 +2190,63 @@ mod tests {
         assert_eq!(cache.len(), 60);
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_jwalk_deep_nested_traversal_and_ignored_dir_pruning() {
+        let base_dir = std::env::temp_dir()
+            .join(format!("doxsearch_jwalk_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&base_dir);
+
+        // 1. Deep nested valid folders
+        let deep_dir = base_dir.join("a").join("b").join("c").join("d");
+        std::fs::create_dir_all(&deep_dir).unwrap();
+        std::fs::write(deep_dir.join("deep_doc.txt"), "Etsittävä termi syvällä").unwrap();
+
+        // 2. Ignored folders that MUST be pruned
+        let nm_dir = base_dir.join("web").join("node_modules").join("package");
+        std::fs::create_dir_all(&nm_dir).unwrap();
+        std::fs::write(nm_dir.join("ignored.txt"), "Etsittävä termi node_modulesissa").unwrap();
+
+        let target_dir = base_dir.join("rust_proj").join("target").join("debug");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("ignored.txt"), "Etsittävä termi targetissa").unwrap();
+
+        let hidden_dir = base_dir.join(".hidden_folder");
+        std::fs::create_dir_all(&hidden_dir).unwrap();
+        std::fs::write(hidden_dir.join("hidden.txt"), "Etsittävä termi piilossa").unwrap();
+
+        let cache = DocumentCache::new();
+        let opts = SearchOptions {
+            directory: base_dir.clone(),
+            query: "Etsittävä".to_string(),
+            recursive: true,
+            search_hidden: false,
+            search_txt: true,
+            ..Default::default()
+        };
+
+        let matches_found = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let m_clone = matches_found.clone();
+        let stats = search_directory(
+            &opts,
+            &cache,
+            None,
+            move |r| m_clone.lock().unwrap().push(r),
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap();
+
+        let results = matches_found.lock().unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "Only deep_doc.txt should be found; node_modules, target, and hidden dirs must be pruned"
+        );
+        assert_eq!(stats.total_count, 1);
+        assert!(results[0].file.ends_with("deep_doc.txt"));
+
+        let _ = std::fs::remove_dir_all(base_dir);
     }
 }
