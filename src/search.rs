@@ -6,8 +6,73 @@ use quick_xml::reader::Reader;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use zip::ZipArchive;
+
+pub const MAX_PDF_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MB max
+pub const HEAVY_FILE_SIZE_THRESHOLD: u64 = 4 * 1024 * 1024; // 4 MB threshold for heavy permit
+pub const MAX_CONCURRENT_HEAVY_EXTRACTIONS: usize = 2;
+
+/// RAII permit for a heavy document extraction task.
+pub struct HeavyTaskPermit<'a> {
+    semaphore: &'a HeavyTaskSemaphore,
+}
+
+impl<'a> Drop for HeavyTaskPermit<'a> {
+    fn drop(&mut self) {
+        if let Ok(mut count) = self.semaphore.permits.lock() {
+            *count += 1;
+            self.semaphore.cvar.notify_one();
+        }
+    }
+}
+
+/// Concurrency limiter for heavy extraction tasks (large PDFs, large files) across threadpools.
+pub struct HeavyTaskSemaphore {
+    permits: Mutex<usize>,
+    cvar: Condvar,
+    #[allow(dead_code)]
+    max_permits: usize,
+}
+
+impl HeavyTaskSemaphore {
+    pub fn new(permits: usize) -> Self {
+        Self {
+            permits: Mutex::new(permits),
+            cvar: Condvar::new(),
+            max_permits: permits,
+        }
+    }
+
+    /// Acquires a permit, waking up periodically to check for search cancellation.
+    pub fn acquire_cancellable(
+        &self,
+        is_cancelled: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Option<HeavyTaskPermit<'_>> {
+        let mut count = self.permits.lock().ok()?;
+        loop {
+            if let Some(cancel) = is_cancelled {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return None;
+                }
+            }
+            if *count > 0 {
+                *count -= 1;
+                return Some(HeavyTaskPermit { semaphore: self });
+            }
+            let (new_count, _) = self
+                .cvar
+                .wait_timeout(count, std::time::Duration::from_millis(50))
+                .ok()?;
+            count = new_count;
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn available_permits(&self) -> usize {
+        self.permits.lock().map(|g| *g).unwrap_or(0)
+    }
+}
 
 #[derive(Hash, PartialEq, Eq, Clone, Debug)]
 pub struct CacheKey {
@@ -448,6 +513,7 @@ fn process_candidate(
     candidate: &SearchCandidate,
     opts: &SearchOptions,
     cache: &DocumentCache,
+    heavy_semaphore: &HeavyTaskSemaphore,
     is_cancelled: Option<&std::sync::atomic::AtomicBool>,
     cached_hits: &std::sync::atomic::AtomicUsize,
     on_match: &(impl Fn(SearchResult) + Sync + Send),
@@ -470,6 +536,16 @@ fn process_candidate(
             cached_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(cached)
         } else {
+            let is_heavy = candidate.ext == "pdf" || candidate.size >= HEAVY_FILE_SIZE_THRESHOLD;
+            let _permit = if is_heavy {
+                match heavy_semaphore.acquire_cancellable(is_cancelled) {
+                    Some(p) => Some(p),
+                    None => return, // cancelled while waiting for heavy permit
+                }
+            } else {
+                None
+            };
+
             let raw_res = match candidate.ext.as_str() {
                 "fodt" | "fods" => extract_flat_xml(&candidate.path),
                 "docx" | "docm" | "dotx" | "dotm" => extract_docx(&candidate.path),
@@ -488,6 +564,16 @@ fn process_candidate(
             }
         }
     } else {
+        let is_heavy = candidate.ext == "pdf" || candidate.size >= HEAVY_FILE_SIZE_THRESHOLD;
+        let _permit = if is_heavy {
+            match heavy_semaphore.acquire_cancellable(is_cancelled) {
+                Some(p) => Some(p),
+                None => return, // cancelled while waiting for heavy permit
+            }
+        } else {
+            None
+        };
+
         match candidate.ext.as_str() {
             "fodt" | "fods" => extract_flat_xml(&candidate.path).map(|t| t.into()),
             "docx" | "docm" | "dotx" | "dotm" => {
@@ -582,12 +668,14 @@ pub fn search_directory(
     let processed = std::sync::atomic::AtomicUsize::new(0);
     let cached_hits = std::sync::atomic::AtomicUsize::new(0);
     let step = if total <= 100 { 1 } else { (total / 100).max(1) };
+    let heavy_semaphore = HeavyTaskSemaphore::new(MAX_CONCURRENT_HEAVY_EXTRACTIONS);
 
     entries.into_par_iter().for_each(|candidate| {
         process_candidate(
             &candidate,
             opts,
             cache,
+            &heavy_semaphore,
             is_cancelled,
             &cached_hits,
             &on_match,
@@ -611,19 +699,27 @@ const MAX_PLAIN_TEXT_FILE_SIZE: u64 = 25 * 1024 * 1024; // 25 MB max
 
 /// Extract text from plain text files (.txt, .md, .csv, .log, .json)
 pub fn extract_plain_text(path: &Path) -> Result<String> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("Could not read file: {}", path.display()))?;
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("Could not get file metadata: {}", path.display()))?;
+    let file_size = metadata.len();
 
-    if bytes.len() as u64 > MAX_PLAIN_TEXT_FILE_SIZE {
+    if file_size > MAX_PLAIN_TEXT_FILE_SIZE {
         return Err(anyhow::anyhow!(
             "Tekstitiedosto on liian suuri (>25 MB): {}",
             path.display()
         ));
     }
 
-    if bytes.is_empty() {
+    if file_size == 0 {
         return Ok(String::new());
     }
+
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("Could not open file: {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(file_size as usize);
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("Could not read file: {}", path.display()))?;
 
     // Binary check: inspect first 4096 bytes
     let sample = &bytes[..bytes.len().min(4096)];
@@ -894,21 +990,32 @@ pub fn extract_text_from_xml(xml: &str) -> Result<String> {
     extract_text_from_xml_reader(reader, is_docx)
 }
 
+const MAX_FALLBACK_STREAM_DECOMPRESSED_BYTES: u64 = 8 * 1024 * 1024; // 8 MB max per stream
+const MAX_FALLBACK_TOTAL_EXTRACTED_BYTES: usize = 10 * 1024 * 1024; // 10 MB max total extracted text
+
 /// Extract text from a .pdf file with header sanitization, panic safety, and fallback stream parsing
 pub fn extract_pdf(path: &Path) -> Result<String> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("Could not read file: {}", path.display()))?;
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("Could not get file metadata: {}", path.display()))?;
+    let file_size = metadata.len();
 
-    if bytes.len() > 100 * 1024 * 1024 {
+    if file_size > MAX_PDF_FILE_SIZE {
         return Err(anyhow::anyhow!(
             "PDF-tiedosto on liian suuri (>100 MB): {}",
             path.display()
         ));
     }
 
-    if bytes.is_empty() {
+    if file_size == 0 {
         return Err(anyhow::anyhow!("Tiedosto on tyhjä (0 tavua)"));
     }
+
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("Could not open file: {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(file_size as usize);
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("Could not read file: {}", path.display()))?;
 
     // 1. Sanitize header: if there are leading bytes before %PDF-, trim to %PDF-
     let pdf_bytes = if let Some(pos) = bytes.windows(5).position(|w| w == b"%PDF-") {
@@ -950,11 +1057,12 @@ pub fn extract_pdf(path: &Path) -> Result<String> {
 /// Fallback parser that scans raw PDF streams when xref table or headers are malformed
 fn extract_pdf_fallback(bytes: &[u8]) -> Option<String> {
     use std::io::Read;
-    let mut extracted_text = String::new();
+    let mut extracted_text = String::with_capacity(4096);
     let mut i = 0;
     let len = bytes.len();
     let mut zlib_buf = Vec::new();
     let mut deflate_buf = Vec::new();
+    let mut stream_extracted = String::new();
 
     while i < len {
         if let Some(stream_pos) = bytes[i..].windows(6).position(|w| w == b"stream") {
@@ -973,24 +1081,34 @@ fn extract_pdf_fallback(bytes: &[u8]) -> Option<String> {
             {
                 let stream_bytes = &bytes[stream_start..stream_start + end_pos];
 
-                // Try decompressing as zlib/flate reusing pre-allocated buffers
+                // Try decompressing as zlib/flate reusing pre-allocated buffers with bounded memory
                 zlib_buf.clear();
                 let mut decoder = flate2::read::ZlibDecoder::new(stream_bytes);
-                let decompressed = if decoder.read_to_end(&mut zlib_buf).is_ok()
+                let decompressed = if decoder
+                    .by_ref()
+                    .take(MAX_FALLBACK_STREAM_DECOMPRESSED_BYTES)
+                    .read_to_end(&mut zlib_buf)
+                    .is_ok()
                     && !zlib_buf.is_empty()
                 {
                     Some(&zlib_buf[..])
                 } else {
                     deflate_buf.clear();
                     let mut decoder2 = flate2::read::DeflateDecoder::new(stream_bytes);
-                    if decoder2.read_to_end(&mut deflate_buf).is_ok() && !deflate_buf.is_empty() {
+                    if decoder2
+                        .by_ref()
+                        .take(MAX_FALLBACK_STREAM_DECOMPRESSED_BYTES)
+                        .read_to_end(&mut deflate_buf)
+                        .is_ok()
+                        && !deflate_buf.is_empty()
+                    {
                         Some(&deflate_buf[..])
                     } else {
                         None
                     }
                 };
 
-                let mut stream_extracted = String::new();
+                stream_extracted.clear();
                 if let Some(dec) = decompressed {
                     extract_text_from_pdf_stream(dec, &mut stream_extracted);
                 }
@@ -1000,6 +1118,10 @@ fn extract_pdf_fallback(bytes: &[u8]) -> Option<String> {
                 if !stream_extracted.trim().is_empty() {
                     extracted_text.push_str(&stream_extracted);
                     extracted_text.push(' ');
+                }
+
+                if extracted_text.len() >= MAX_FALLBACK_TOTAL_EXTRACTED_BYTES {
+                    break;
                 }
 
                 i = stream_start + end_pos + 9;
@@ -1023,8 +1145,9 @@ fn extract_text_from_pdf_stream(stream: &[u8], out: &mut String) {
     let mut in_paren = false;
     let mut in_hex = false;
     let mut escaped = false;
-    let mut current_str: Vec<u8> = Vec::new();
-    let mut hex_str: Vec<u8> = Vec::new();
+    let mut current_str: Vec<u8> = Vec::with_capacity(256);
+    let mut hex_str: Vec<u8> = Vec::with_capacity(256);
+    let mut decoded: Vec<u8> = Vec::with_capacity(128);
 
     for &b in stream {
         if in_paren {
@@ -1067,7 +1190,7 @@ fn extract_text_from_pdf_stream(stream: &[u8], out: &mut String) {
                     .copied()
                     .filter(|c| !c.is_ascii_whitespace())
                     .collect();
-                let mut decoded = Vec::with_capacity(hex_clean.len() / 2);
+                decoded.clear();
                 let mut chunk = hex_clean.chunks_exact(2);
                 for pair in &mut chunk {
                     if let (Ok(h1), Ok(h2)) = (
@@ -1128,6 +1251,7 @@ pub fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
+#[allow(dead_code)]
 pub fn starts_with_ignore_case(text_slice: &str, query: &str) -> Option<usize> {
     let mut text_chars = text_slice.chars().peekable();
     let mut query_chars = query.chars().peekable();
@@ -1183,6 +1307,7 @@ pub fn starts_with_ignore_case(text_slice: &str, query: &str) -> Option<usize> {
     Some(bytes_read)
 }
 
+#[allow(dead_code)]
 pub fn starts_with_exact(text_slice: &str, query: &str) -> Option<usize> {
     let mut text_chars = text_slice.chars().peekable();
     let mut query_chars = query.chars().peekable();
@@ -2249,4 +2374,146 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(base_dir);
     }
+
+    #[test]
+    fn test_heavy_task_semaphore_limiting_and_raii() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let semaphore = Arc::new(HeavyTaskSemaphore::new(2));
+        let active_tasks = Arc::new(AtomicUsize::new(0));
+        let max_observed_concurrent = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        for _ in 0..10 {
+            let sem = Arc::clone(&semaphore);
+            let active = Arc::clone(&active_tasks);
+            let max_obs = Arc::clone(&max_observed_concurrent);
+
+            let handle = thread::spawn(move || {
+                let permit = sem.acquire_cancellable(None);
+                assert!(permit.is_some());
+
+                let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_obs.fetch_max(cur, Ordering::SeqCst);
+
+                // Simulate heavy work
+                thread::sleep(std::time::Duration::from_millis(20));
+
+                active.fetch_sub(1, Ordering::SeqCst);
+                drop(permit);
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(semaphore.available_permits(), 2);
+        assert!(
+            max_observed_concurrent.load(Ordering::SeqCst) <= 2,
+            "Concurrent heavy tasks must never exceed semaphore limit (2)"
+        );
+    }
+
+    #[test]
+    fn test_heavy_task_semaphore_cancellation() {
+        let semaphore = HeavyTaskSemaphore::new(1);
+        let permit = semaphore.acquire_cancellable(None);
+        assert!(permit.is_some());
+
+        // Now semaphore is exhausted (0 permits)
+        let cancel_flag = std::sync::atomic::AtomicBool::new(true);
+        let cancelled_permit = semaphore.acquire_cancellable(Some(&cancel_flag));
+        assert!(
+            cancelled_permit.is_none(),
+            "Cancelled request must abort and return None immediately"
+        );
+    }
+
+    #[test]
+    fn test_extract_pdf_oversized_metadata_rejection() {
+        let temp_dir = std::env::temp_dir();
+        let large_fake_pdf = temp_dir.join("doxsearch_test_huge.pdf");
+
+        // Write a sparse file / truncate file of 105 MB
+        let file = std::fs::File::create(&large_fake_pdf).expect("create file failed");
+        file.set_len(105 * 1024 * 1024).expect("set_len failed");
+
+        let result = extract_pdf(&large_fake_pdf);
+        assert!(
+            result.is_err(),
+            "Oversized PDF (>100MB) must be rejected immediately via metadata"
+        );
+        let err_msg = result.err().unwrap().to_string();
+        assert!(err_msg.contains(">100 MB"));
+
+        let _ = std::fs::remove_file(large_fake_pdf);
+    }
+
+    #[test]
+    fn test_extract_plain_text_oversized_rejection() {
+        let temp_dir = std::env::temp_dir();
+        let large_fake_txt = temp_dir.join("doxsearch_test_huge.txt");
+
+        let file = std::fs::File::create(&large_fake_txt).expect("create file failed");
+        file.set_len(30 * 1024 * 1024).expect("set_len failed");
+
+        let result = extract_plain_text(&large_fake_txt);
+        assert!(
+            result.is_err(),
+            "Oversized text file (>25MB) must be rejected immediately via metadata"
+        );
+        let err_msg = result.err().unwrap().to_string();
+        assert!(err_msg.contains(">25 MB"));
+
+        let _ = std::fs::remove_file(large_fake_txt);
+    }
+
+    #[test]
+    fn test_parallel_pdf_search_with_semaphore() {
+        let temp_dir = std::env::temp_dir().join(format!("doxsearch_multi_pdf_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        // Create 8 small mock PDF files
+        for i in 0..8 {
+            let pdf_path = temp_dir.join(format!("test_doc_{}.pdf", i));
+            let content = format!(
+                "%PDF-1.4\n1 0 obj\n<< /Length 60 >>\nstream\nBT (EtsittavaPDFSisalto tiedostossa {}) Tj ET\nendstream\nendobj\n%%EOF",
+                i
+            );
+            std::fs::write(&pdf_path, content.as_bytes()).unwrap();
+        }
+
+        let cache = DocumentCache::new();
+        let opts = SearchOptions {
+            directory: temp_dir.clone(),
+            query: "EtsittavaPDFSisalto".to_string(),
+            search_docx: false,
+            search_odt: false,
+            search_pdf: true,
+            search_txt: false,
+            ..Default::default()
+        };
+
+        let matches_found = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let m_clone = matches_found.clone();
+        let stats = search_directory(
+            &opts,
+            &cache,
+            None,
+            move |r| m_clone.lock().unwrap().push(r),
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap();
+
+        assert_eq!(stats.total_count, 8);
+        assert_eq!(matches_found.lock().unwrap().len(), 8);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
 }
+
