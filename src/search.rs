@@ -915,26 +915,23 @@ pub fn unescape_xml_into(raw: &[u8], out: &mut String) {
 pub fn extract_docx(path: &Path) -> Result<String> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("Could not open file: {}", path.display()))?;
-    let mut archive = ZipArchive::new(std::io::BufReader::new(file))
+    let mut archive = ZipArchive::new(file)
         .with_context(|| format!("Could not read ZIP archive: {}", path.display()))?;
 
     // Collect all XML parts by index: word/document.xml, word/header*.xml, word/footer*.xml, word/footnotes.xml, word/endnotes.xml, word/comments.xml
     let mut xml_entries: Vec<(usize, String)> = Vec::new();
-    for i in 0..archive.len() {
-        if let Ok(file) = archive.by_index(i) {
-            let name = file.name();
-            let n = name.replace('\\', "/").to_lowercase();
-            if n.starts_with("word/")
-                && n.ends_with(".xml")
-                && (n == "word/document.xml"
-                    || n.starts_with("word/header")
-                    || n.starts_with("word/footer")
-                    || n.starts_with("word/footnotes")
-                    || n.starts_with("word/endnotes")
-                    || n.starts_with("word/comments"))
-            {
-                xml_entries.push((i, n));
-            }
+    for (i, name) in archive.file_names().enumerate() {
+        let n = name.replace('\\', "/").to_lowercase();
+        if n.starts_with("word/")
+            && n.ends_with(".xml")
+            && (n == "word/document.xml"
+                || n.starts_with("word/header")
+                || n.starts_with("word/footer")
+                || n.starts_with("word/footnotes")
+                || n.starts_with("word/endnotes")
+                || n.starts_with("word/comments"))
+        {
+            xml_entries.push((i, n));
         }
     }
 
@@ -991,7 +988,7 @@ pub fn extract_flat_xml(path: &Path) -> Result<String> {
 pub fn extract_odt(path: &Path) -> Result<String> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("Could not open file: {}", path.display()))?;
-    let mut archive = ZipArchive::new(std::io::BufReader::new(file))
+    let mut archive = ZipArchive::new(file)
         .with_context(|| format!("Could not read ZIP archive: {}", path.display()))?;
 
     let mut full_text = String::with_capacity(4096);
@@ -2722,6 +2719,60 @@ mod tests {
         out.clear();
         unescape_xml_into(b"Rock & Roll &unknown; &amp; End", &mut out);
         assert_eq!(out, "Rock & Roll &unknown; & End");
+    }
+
+    #[test]
+    fn test_extract_docx_and_odt_archives() {
+        use std::io::Write;
+        let temp_dir = std::env::temp_dir().join(format!("doxsearch_zip_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        // 1. Create a dummy docx (ZIP archive with word/document.xml and word/header1.xml)
+        let docx_path = temp_dir.join("test_sample.docx");
+        {
+            let file = std::fs::File::create(&docx_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+
+            zip.start_file("word/header1.xml", options).unwrap();
+            zip.write_all(b"<w:hdr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:p><w:r><w:t>Header Text</w:t></w:r></w:p></w:hdr>").unwrap();
+
+            zip.start_file("word/document.xml", options).unwrap();
+            zip.write_all(b"<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r><w:t>Main Document Content</w:t></w:r></w:p></w:body></w:document>").unwrap();
+
+            zip.finish().unwrap();
+        }
+
+        let docx_text = extract_docx(&docx_path).expect("Failed to extract docx");
+        assert!(docx_text.contains("Main Document Content"));
+        assert!(docx_text.contains("Header Text"));
+
+        // 2. Create a dummy odt (ZIP archive with content.xml and styles.xml)
+        let odt_path = temp_dir.join("test_sample.odt");
+        {
+            let file = std::fs::File::create(&odt_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+
+            zip.start_file("content.xml", options).unwrap();
+            zip.write_all(b"<office:document-content xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\"><text:p>ODT Main Content</text:p></office:document-content>").unwrap();
+
+            zip.start_file("styles.xml", options).unwrap();
+            zip.write_all(b"<office:document-styles xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\"><text:p>ODT Header Styles</text:p></office:document-styles>").unwrap();
+
+            zip.finish().unwrap();
+        }
+
+        let odt_text = extract_odt(&odt_path).expect("Failed to extract odt");
+        assert!(odt_text.contains("ODT Main Content"));
+        assert!(odt_text.contains("ODT Header Styles"));
+
+        // Clean up
+        let _ = std::fs::remove_file(&docx_path);
+        let _ = std::fs::remove_file(&odt_path);
+        let _ = std::fs::remove_dir(&temp_dir);
     }
 }
 
