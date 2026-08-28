@@ -397,15 +397,30 @@ pub fn save_file_dialog(default_name: &str, filter_ext: &str) -> Option<PathBuf>
 }
 
 #[cfg(target_os = "linux")]
-static DBUS_FM_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static DBUS_FM_IN_FLIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[cfg(target_os = "linux")]
 struct InFlightGuard;
 
 #[cfg(target_os = "linux")]
+impl InFlightGuard {
+    fn try_acquire() -> Option<Self> {
+        DBUS_FM_IN_FLIGHT.with(|flag| {
+            (!flag.replace(true)).then_some(Self)
+        })
+    }
+
+    fn release(&self) {
+        DBUS_FM_IN_FLIGHT.with(|flag| flag.set(false));
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        DBUS_FM_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.release();
     }
 }
 
@@ -428,13 +443,14 @@ enum DbusFmOutcome {
 fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> DbusFmOutcome {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    // Prevent thread accumulation: allow at most one in-flight D-Bus call at a time
-    if DBUS_FM_IN_FLIGHT
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return DbusFmOutcome::TimedOutOrBusy("D-Bus FileManager1 call already in progress".to_string());
-    }
+    let in_flight = match InFlightGuard::try_acquire() {
+        Some(guard) => guard,
+        None => {
+            return DbusFmOutcome::TimedOutOrBusy(
+                "D-Bus FileManager1 call already in progress".to_string(),
+            );
+        }
+    };
 
     let (done_tx, done_rx) = crossbeam_channel::bounded(1);
     let uri_str = uri.to_string();
@@ -444,8 +460,6 @@ fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> DbusFmOutcome {
     let spawn_res = thread::Builder::new()
         .name("dbus-fm-call".to_string())
         .spawn(move || {
-            let _guard = InFlightGuard;
-
             if cancelled_worker.load(Ordering::SeqCst) {
                 return;
             }
@@ -496,11 +510,11 @@ fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> DbusFmOutcome {
         });
 
     if let Err(e) = spawn_res {
-        DBUS_FM_IN_FLIGHT.store(false, Ordering::SeqCst);
+        drop(in_flight);
         return DbusFmOutcome::Unavailable(format!("Failed to spawn D-Bus thread: {e}"));
     }
 
-    match done_rx.recv_timeout(std::time::Duration::from_millis(1500)) {
+    let outcome = match done_rx.recv_timeout(std::time::Duration::from_millis(1500)) {
         Ok(Ok(())) => DbusFmOutcome::Success,
         Ok(Err(e)) => DbusFmOutcome::Unavailable(e),
         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -511,7 +525,10 @@ fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> DbusFmOutcome {
             cancelled.store(true, Ordering::SeqCst);
             DbusFmOutcome::Unavailable("D-Bus thread disconnected unexpectedly".to_string())
         }
-    }
+    };
+
+    drop(in_flight);
+    outcome
 }
 
 pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
@@ -2210,6 +2227,26 @@ mod tests {
         assert_eq!(file_type_color("PDF"), ORANGE);
         assert_eq!(file_type_color("TXT"), PURPLE);
         assert_eq!(file_type_color("UNKNOWN"), TEXT_MED);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_dbus_in_flight_flag_is_thread_local() {
+        let guard = InFlightGuard::try_acquire().expect("main thread should acquire once");
+        assert!(
+            InFlightGuard::try_acquire().is_none(),
+            "same-thread reentry must be blocked while a call is in flight"
+        );
+
+        let other_thread_can_acquire = std::thread::spawn(|| InFlightGuard::try_acquire().is_some())
+            .join()
+            .expect("other thread should finish");
+        assert!(
+            other_thread_can_acquire,
+            "the in-flight guard must not be process-global across threads"
+        );
+
+        drop(guard);
     }
 
     #[cfg(target_os = "linux")]
