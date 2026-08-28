@@ -112,10 +112,6 @@ pub fn clean_path(p: PathBuf) -> PathBuf {
 pub struct SearchCandidate {
     pub path: PathBuf,
     pub ext: String,
-    #[allow(dead_code)]
-    pub size: u64,
-    #[allow(dead_code)]
-    pub modified: Option<std::time::SystemTime>,
 }
 
 static GLOBAL_CACHE_TICK: AtomicU64 = AtomicU64::new(1);
@@ -480,7 +476,6 @@ pub fn scan_candidates(
 
         let meta = meta_res.or_else(|| std::fs::metadata(&path).ok());
         let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-        let modified = meta.and_then(|m| m.modified().ok());
 
         if let Some(max_mb) = max_file_size_mb {
             let max_bytes = max_mb.saturating_mul(1024 * 1024);
@@ -489,12 +484,7 @@ pub fn scan_candidates(
             }
         }
 
-        candidates.push(SearchCandidate {
-            path,
-            ext,
-            size,
-            modified,
-        });
+        candidates.push(SearchCandidate { path, ext });
     }
 
     candidates
