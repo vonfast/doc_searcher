@@ -846,9 +846,9 @@ pub fn extract_docx(path: &Path) -> Result<String> {
     let mut archive = ZipArchive::new(file)
         .with_context(|| format!("Could not read ZIP archive: {}", path.display()))?;
 
-    // Collect all XML parts by index: word/document.xml, word/header*.xml, word/footer*.xml, word/footnotes.xml, word/endnotes.xml, word/comments.xml
-    let mut xml_entries: Vec<(usize, String)> = Vec::new();
-    for (i, name) in archive.file_names().enumerate() {
+    // Collect all XML parts by name: word/document.xml, word/header*.xml, word/footer*.xml, word/footnotes.xml, word/endnotes.xml, word/comments.xml
+    let mut xml_entries: Vec<String> = Vec::new();
+    for name in archive.file_names() {
         let n = name.replace('\\', "/").to_lowercase();
         if n.starts_with("word/")
             && n.ends_with(".xml")
@@ -859,7 +859,7 @@ pub fn extract_docx(path: &Path) -> Result<String> {
                 || n.starts_with("word/endnotes")
                 || n.starts_with("word/comments"))
         {
-            xml_entries.push((i, n));
+            xml_entries.push(name.to_string());
         }
     }
 
@@ -872,19 +872,21 @@ pub fn extract_docx(path: &Path) -> Result<String> {
 
     // Ensure word/document.xml comes first
     xml_entries.sort_by(|a, b| {
-        let a_main = a.1.ends_with("document.xml");
-        let b_main = b.1.ends_with("document.xml");
+        let a_norm = a.replace('\\', "/").to_lowercase();
+        let b_norm = b.replace('\\', "/").to_lowercase();
+        let a_main = a_norm.ends_with("document.xml");
+        let b_main = b_norm.ends_with("document.xml");
         match (a_main, b_main) {
-            (true, true) => a.1.cmp(&b.1),
+            (true, true) => a_norm.cmp(&b_norm),
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
-            (false, false) => a.1.cmp(&b.1),
+            (false, false) => a_norm.cmp(&b_norm),
         }
     });
 
     let mut full_text = String::with_capacity(4096);
-    for (idx, xml_name) in xml_entries {
-        let entry = archive.by_index(idx).with_context(|| {
+    for xml_name in xml_entries {
+        let entry = archive.by_name(&xml_name).with_context(|| {
             format!("Could not read part {xml_name} in docx: {}", path.display())
         })?;
         let reader = Reader::from_reader(std::io::BufReader::new(entry));
