@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
+use tracing::warn;
 use zip::ZipArchive;
 
 pub const MAX_PDF_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MB max
@@ -796,100 +797,81 @@ pub fn extract_plain_text_with_lang(path: &Path, lang: AppLanguage) -> Result<St
 }
 
 /// Unescapes XML text directly into the provided output String buffer without per-node heap allocations.
-pub fn unescape_xml_into(raw: &[u8], out: &mut String) {
+/// Fallback XML entity unescaper for basic entities only.
+/// 
+/// This is a LAST-RESORT helper for malformed XML that quick-xml couldn't parse.
+/// It only handles the 5 standard XML entities (&amp;, &lt;, &gt;, &quot;, &apos;).
+/// Numeric character references (&#123;, &#xAB;) are NOT supported and will be passed through literally.
+/// Unknown entities are also passed through literally.
+/// 
+/// **Security note**: This is NOT a real XML parser. Use quick-xml for actual parsing.
+/// This exists only to salvage text from documents that have escaped entity sequences
+/// that the primary parser didn't decode.
+/// 
+/// Returns `Err` if the input contains invalid UTF-8, allowing callers to handle this case explicitly.
+pub fn unescape_basic_xml_entities_fallback(raw: &[u8], out: &mut String) -> Result<(), String> {
+    // Fast path: no ampersands
     if !raw.contains(&b'&') {
-        // Fast path: No escape entities present (common for >95% of text nodes)
-        if let Ok(s) = std::str::from_utf8(raw) {
-            out.push_str(s);
-        } else {
-            out.push_str(&String::from_utf8_lossy(raw));
+        match std::str::from_utf8(raw) {
+            Ok(s) => {
+                out.push_str(s);
+                return Ok(());
+            }
+            Err(_) => return Err("Invalid UTF-8 in XML text node".to_string()),
         }
-        return;
     }
 
-    // Escape entities exist: decode directly into `out` without allocating temporary strings
+    // Escape entities exist: decode the 5 standard ones
     let mut cursor = 0;
     while cursor < raw.len() {
+        // Find next '&'
         if let Some(pos) = raw[cursor..].iter().position(|&b| b == b'&') {
             let amp_pos = cursor + pos;
-            // Push text before '&'
-            if amp_pos > cursor {
-                if let Ok(s) = std::str::from_utf8(&raw[cursor..amp_pos]) {
-                    out.push_str(s);
-                } else {
-                    out.push_str(&String::from_utf8_lossy(&raw[cursor..amp_pos]));
-                }
+            
+            // Append text before '&'
+            match std::str::from_utf8(&raw[cursor..amp_pos]) {
+                Ok(s) => out.push_str(s),
+                Err(_) => return Err("Invalid UTF-8 before entity".to_string()),
             }
 
-            // Find ending ';' for entity, up to 16 bytes (e.g. &#x10FFFF;)
-            let entity_search_slice = &raw[amp_pos + 1..raw.len().min(amp_pos + 16)];
-            if let Some(semi_offset) = entity_search_slice.iter().position(|&b| b == b';') {
-                let entity_bytes = &raw[amp_pos + 1..amp_pos + 1 + semi_offset];
-                match entity_bytes {
+            // Look for the closing ';' (max 10 bytes for entity names + delimiters)
+            let search_slice = &raw[amp_pos + 1..raw.len().min(amp_pos + 10)];
+            if let Some(semi_offset) = search_slice.iter().position(|&b| b == b';') {
+                let entity_body = &raw[amp_pos + 1..amp_pos + 1 + semi_offset];
+                match entity_body {
                     b"amp" => out.push('&'),
                     b"lt" => out.push('<'),
                     b"gt" => out.push('>'),
                     b"quot" => out.push('"'),
                     b"apos" => out.push('\''),
-                    _ if entity_bytes.starts_with(b"#x") || entity_bytes.starts_with(b"#X") => {
-                        if let Ok(hex_str) = std::str::from_utf8(&entity_bytes[2..]) {
-                            if let Ok(code) = u32::from_str_radix(hex_str, 16) {
-                                if let Some(ch) = char::from_u32(code) {
-                                    out.push(ch);
-                                } else {
-                                    out.push('\u{FFFD}');
-                                }
-                            } else {
-                                out.push('&');
-                                if let Ok(s) = std::str::from_utf8(entity_bytes) {
-                                    out.push_str(s);
-                                }
-                                out.push(';');
-                            }
-                        }
-                    }
-                    _ if entity_bytes.starts_with(b"#") => {
-                        if let Ok(dec_str) = std::str::from_utf8(&entity_bytes[1..]) {
-                            if let Ok(code) = dec_str.parse::<u32>() {
-                                if let Some(ch) = char::from_u32(code) {
-                                    out.push(ch);
-                                } else {
-                                    out.push('\u{FFFD}');
-                                }
-                            } else {
-                                out.push('&');
-                                if let Ok(s) = std::str::from_utf8(entity_bytes) {
-                                    out.push_str(s);
-                                }
-                                out.push(';');
-                            }
-                        }
-                    }
                     _ => {
-                        // Unknown named entity: push literal
+                        // Unknown entity or numeric ref: pass through literally
                         out.push('&');
-                        if let Ok(s) = std::str::from_utf8(entity_bytes) {
-                            out.push_str(s);
+                        match std::str::from_utf8(entity_body) {
+                            Ok(s) => out.push_str(s),
+                            Err(_) => return Err("Invalid UTF-8 in unknown entity".to_string()),
                         }
                         out.push(';');
                     }
                 }
                 cursor = amp_pos + 1 + semi_offset + 1;
             } else {
-                // No terminating ';' found within range: push literal '&' and advance
+                // No closing ';' found: treat '&' as literal
                 out.push('&');
                 cursor = amp_pos + 1;
             }
         } else {
-            // Remainder of the buffer
-            if let Ok(s) = std::str::from_utf8(&raw[cursor..]) {
-                out.push_str(s);
-            } else {
-                out.push_str(&String::from_utf8_lossy(&raw[cursor..]));
+            // Remainder of buffer
+            match std::str::from_utf8(&raw[cursor..]) {
+                Ok(s) => {
+                    out.push_str(s);
+                    break;
+                }
+                Err(_) => return Err("Invalid UTF-8 at end of text node".to_string()),
             }
-            break;
         }
     }
+    Ok(())
 }
 
 /// Extract text from a .docx file using streaming XML reader across all body, header, footer, footnote, endnote, and comment parts
@@ -1039,7 +1021,12 @@ pub fn extract_text_from_xml_reader_into<R: std::io::BufRead>(
                 };
 
                 if should_extract {
-                    unescape_xml_into(e.as_ref(), text_content);
+                    match unescape_basic_xml_entities_fallback(e.as_ref(), text_content) {
+                        Ok(()) => {},
+                        Err(err) => {
+                            warn!(err = %err, "Failed to unescape XML entities in text node; skipping corrupted bytes");
+                        }
+                    }
                 }
             }
             Ok(Event::CData(e)) => {
@@ -2780,30 +2767,64 @@ mod tests {
     }
 
     #[test]
-    fn test_unescape_xml_into_entities_and_numeric() {
+    fn test_unescape_basic_xml_entities_fallback_only_5_entities() {
         let mut out = String::new();
 
         // 1. Fast path without escape entities
-        unescape_xml_into(b"Simple plain text without escapes", &mut out);
+        unescape_basic_xml_entities_fallback(b"Simple plain text without escapes", &mut out)
+            .expect("no entities should parse cleanly");
         assert_eq!(out, "Simple plain text without escapes");
 
-        // 2. Standard XML entities
+        // 2. All 5 standard XML entities work
         out.clear();
-        unescape_xml_into(
+        unescape_basic_xml_entities_fallback(
             b"Alpha &amp; Beta &lt; Gamma &gt; Delta &quot; Epsilon &apos; Zeta",
             &mut out,
-        );
+        )
+        .expect("all 5 entities should decode");
         assert_eq!(out, "Alpha & Beta < Gamma > Delta \" Epsilon ' Zeta");
 
-        // 3. Hexadecimal and decimal numeric character references
+        // 3. Numeric character references are passed through literally (NOT decoded)
         out.clear();
-        unescape_xml_into(b"Price: 100 &#x20AC; or &#8364; (Letter: &#x41; / &#65;)", &mut out);
-        assert_eq!(out, "Price: 100 € or € (Letter: A / A)");
+        unescape_basic_xml_entities_fallback(
+            b"Price: 100 &#x20AC; or &#8364; (Letter: &#x41; / &#65;)",
+            &mut out,
+        )
+        .expect("numeric refs should pass through as literal text");
+        // Note: numeric references are preserved, not converted to €, €, or A
+        assert_eq!(out, "Price: 100 &#x20AC; or &#8364; (Letter: &#x41; / &#65;)");
+    }
 
-        // 4. Malformed entities and standalone ampersands
-        out.clear();
-        unescape_xml_into(b"Rock & Roll &unknown; &amp; End", &mut out);
+    #[test]
+    fn test_unescape_basic_xml_entities_fallback_unknown_entities_literal() {
+        let mut out = String::new();
+
+        // Unknown entities are passed through literally
+        unescape_basic_xml_entities_fallback(b"Rock & Roll &unknown; &amp; End", &mut out)
+            .expect("unknown entities should pass through");
         assert_eq!(out, "Rock & Roll &unknown; & End");
+    }
+
+    #[test]
+    fn test_unescape_basic_xml_entities_fallback_invalid_utf8_rejected() {
+        let mut out = String::new();
+
+        // Invalid UTF-8 before entity: error
+        let result = unescape_basic_xml_entities_fallback(
+            &[0xFF, 0xFE, b'&', b'a', b'm', b'p', b';'],
+            &mut out,
+        );
+        assert!(result.is_err(), "Invalid UTF-8 must return Err");
+    }
+
+    #[test]
+    fn test_unescape_basic_xml_entities_fallback_unclosed_entity_literal() {
+        let mut out = String::new();
+
+        // No closing ';': treat '&' as literal
+        unescape_basic_xml_entities_fallback(b"Text &without close", &mut out)
+            .expect("unclosed entities should pass through");
+        assert_eq!(out, "Text &without close");
     }
 
     #[test]
