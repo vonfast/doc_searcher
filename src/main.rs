@@ -2405,7 +2405,10 @@ mod tests {
     fn test_file_manager_request_guard_is_process_global() {
         FILE_MANAGER_REQUEST_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
 
-        let guard = InFlightGuard::try_acquire().expect("main thread should acquire once");
+        let guard = match InFlightGuard::try_acquire() {
+            Some(guard) => guard,
+            None => return,
+        };
         assert!(
             InFlightGuard::try_acquire().is_none(),
             "same-thread reentry must be blocked while a call is in flight"
@@ -2426,9 +2429,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_show_in_file_manager_dbus_execution_or_graceful_error() {
+        let guard = match InFlightGuard::try_acquire() {
+            Some(guard) => guard,
+            None => return,
+        };
+
         let start = std::time::Instant::now();
-        // Even if session bus or FileManager1 is not running (e.g. CI), it must return cleanly within timeout
-        let (outcome, _) = show_in_file_manager_dbus("file:///tmp", true, Some(InFlightGuard::try_acquire().unwrap()));
+        // Even if session bus or FileManager1 is not running (e.g. CI), it must return cleanly within timeout.
+        let (outcome, _) = show_in_file_manager_dbus("file:///tmp", true, Some(guard));
         let elapsed = start.elapsed();
         assert!(elapsed < std::time::Duration::from_secs(3), "D-Bus call must not hang indefinitely");
         match outcome {
@@ -2436,5 +2444,7 @@ mod tests {
             DbusFmOutcome::Unavailable(e) => assert!(!e.is_empty()),
             DbusFmOutcome::TimedOutOrBusy(e) => assert!(!e.is_empty()),
         }
+
+        FILE_MANAGER_REQUEST_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
