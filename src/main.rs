@@ -413,7 +413,8 @@ static FILE_MANAGER_REQUEST_IN_FLIGHT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(target_os = "linux")]
-struct InFlightGuard;
+#[derive(Clone)]
+struct InFlightGuard(std::sync::Arc<()>);
 
 #[cfg(target_os = "linux")]
 impl InFlightGuard {
@@ -423,11 +424,13 @@ impl InFlightGuard {
         FILE_MANAGER_REQUEST_IN_FLIGHT
             .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
             .ok()
-            .map(|_| Self)
+            .map(|_| Self(std::sync::Arc::new(())))
     }
 
     fn release(&self) {
-        FILE_MANAGER_REQUEST_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+        if std::sync::Arc::strong_count(&self.0) == 1 {
+            FILE_MANAGER_REQUEST_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 
@@ -455,7 +458,11 @@ enum DbusFmOutcome {
 /// - If D-Bus times out (busy or slow daemon), we do NOT trigger the CLI fallback to prevent opening
 ///   two competing file manager windows once the daemon wakes up.
 #[cfg(target_os = "linux")]
-fn show_in_file_manager_dbus(uri: &str, is_dir: bool, guard: InFlightGuard) -> DbusFmOutcome {
+fn show_in_file_manager_dbus(
+    uri: &str,
+    is_dir: bool,
+    guard: Option<InFlightGuard>,
+) -> (DbusFmOutcome, Option<InFlightGuard>) {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let (done_tx, done_rx) = crossbeam_channel::bounded(1);
@@ -463,10 +470,18 @@ fn show_in_file_manager_dbus(uri: &str, is_dir: bool, guard: InFlightGuard) -> D
     let cancelled = std::sync::Arc::new(AtomicBool::new(false));
     let cancelled_worker = cancelled.clone();
 
+    let Some(guard) = guard else {
+        return (
+            DbusFmOutcome::Unavailable("file-manager guard already consumed".to_string()),
+            None,
+        );
+    };
+
+    let worker_guard = guard.clone();
     let spawn_res = thread::Builder::new()
         .name("dbus-fm-call".to_string())
         .spawn(move || {
-            let _guard = guard;
+            let _guard = worker_guard;
             if cancelled_worker.load(Ordering::SeqCst) {
                 return;
             }
@@ -517,10 +532,13 @@ fn show_in_file_manager_dbus(uri: &str, is_dir: bool, guard: InFlightGuard) -> D
         });
 
     if let Err(e) = spawn_res {
-        return DbusFmOutcome::Unavailable(format!("Failed to spawn D-Bus thread: {e}"));
+        return (
+            DbusFmOutcome::Unavailable(format!("Failed to spawn D-Bus thread: {e}")),
+            Some(guard),
+        );
     }
 
-    match done_rx.recv_timeout(std::time::Duration::from_millis(1500)) {
+    let outcome = match done_rx.recv_timeout(std::time::Duration::from_millis(1500)) {
         Ok(Ok(())) => DbusFmOutcome::Success,
         Ok(Err(e)) => DbusFmOutcome::Unavailable(e),
         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -531,6 +549,11 @@ fn show_in_file_manager_dbus(uri: &str, is_dir: bool, guard: InFlightGuard) -> D
             cancelled.store(true, Ordering::SeqCst);
             DbusFmOutcome::Unavailable("D-Bus thread disconnected unexpectedly".to_string())
         }
+    };
+
+    match outcome {
+        DbusFmOutcome::TimedOutOrBusy(_) | DbusFmOutcome::Success => (outcome, None),
+        DbusFmOutcome::Unavailable(_) => (outcome, Some(guard)),
     }
 }
 
@@ -545,7 +568,7 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
     }
 
     #[cfg(target_os = "linux")]
-    let _in_flight = match InFlightGuard::try_acquire() {
+    let in_flight = match InFlightGuard::try_acquire() {
         Some(guard) => guard,
         None => {
             #[cfg(debug_assertions)]
@@ -596,18 +619,28 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
 
         // 1. Ensisijainen: Kevyt D-Bus IPC (org.freedesktop.FileManager1) zbus-kirjaston kautta.
         // Ei luo uutta prosessia ja pyytää taustalla olevaa tiedostonhallintaa korostamaan kohteen.
-        match show_in_file_manager_dbus(&uri, is_dir, _in_flight) {
-            DbusFmOutcome::Success => Ok(()),
+        let (dbus_outcome, dbus_guard) = show_in_file_manager_dbus(&uri, is_dir, Some(in_flight));
+        match dbus_outcome {
+            DbusFmOutcome::Success => {
+                let _ = dbus_guard;
+                Ok(())
+            }
             DbusFmOutcome::TimedOutOrBusy(msg) => {
                 #[cfg(debug_assertions)]
                 eprintln!("[DoXsearch] D-Bus in progress/timed out ({msg}); waiting for D-Bus without spawning duplicate CLI process.");
                 // Pyyntö on D-Bus-väylällä työn alla. Emme käynnistä rinnakkaista CLI-prosessia,
                 // jotta vältetään kahden ikkunan aukeaminen (kaksoisavaus).
+                let _ = dbus_guard;
                 Ok(())
             }
             DbusFmOutcome::Unavailable(dbus_err) => {
                 #[cfg(debug_assertions)]
                 eprintln!("[DoXsearch] D-Bus FileManager1 unavailable: {dbus_err}. Falling back to CLI selection...");
+
+                // Keep the process-wide guard alive through the CLI fallback so repeated clicks remain
+                // serialized even when the bus is absent or fails to spawn.
+                let cli_guard = dbus_guard.expect("unavailable D-Bus path should return the guard for the CLI fallback");
+                let _cli_guard = cli_guard;
 
                 // 2. Toissijainen varatapa: Jos D-Bus ei ole lainkaan käytettävissä (esim. SSH, rikkinäinen väylä tai rajoitettu Flatpak),
                 // yritetään suoraa tiedostonhallintakomentoa valintalipun (--select) kera kohteen korostamiseksi.
@@ -2395,7 +2428,7 @@ mod tests {
     fn test_show_in_file_manager_dbus_execution_or_graceful_error() {
         let start = std::time::Instant::now();
         // Even if session bus or FileManager1 is not running (e.g. CI), it must return cleanly within timeout
-        let outcome = show_in_file_manager_dbus("file:///tmp", true, InFlightGuard::try_acquire().unwrap());
+        let (outcome, _) = show_in_file_manager_dbus("file:///tmp", true, Some(InFlightGuard::try_acquire().unwrap()));
         let elapsed = start.elapsed();
         assert!(elapsed < std::time::Duration::from_secs(3), "D-Bus call must not hang indefinitely");
         match outcome {
