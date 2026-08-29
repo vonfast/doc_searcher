@@ -683,6 +683,7 @@ fn format_localized_error(lang: AppLanguage, finnish: &str, english: &str) -> St
 }
 
 /// Extract text from plain text files (.txt, .md, .csv, .log, .json)
+#[allow(dead_code)]
 pub fn extract_plain_text(path: &Path) -> Result<String> {
     extract_plain_text_with_lang(path, AppLanguage::English)
 }
@@ -1089,6 +1090,7 @@ const MAX_FALLBACK_STREAM_DECOMPRESSED_BYTES: u64 = 8 * 1024 * 1024; // 8 MB max
 const MAX_FALLBACK_TOTAL_EXTRACTED_BYTES: usize = 10 * 1024 * 1024; // 10 MB max total extracted text
 
 /// Extract text from a .pdf file with header sanitization, panic safety, and fallback stream parsing
+#[allow(dead_code)]
 pub fn extract_pdf(path: &Path) -> Result<String> {
     extract_pdf_with_lang(path, AppLanguage::English)
 }
