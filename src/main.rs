@@ -455,7 +455,7 @@ enum DbusFmOutcome {
 /// - If D-Bus times out (busy or slow daemon), we do NOT trigger the CLI fallback to prevent opening
 ///   two competing file manager windows once the daemon wakes up.
 #[cfg(target_os = "linux")]
-fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> DbusFmOutcome {
+fn show_in_file_manager_dbus(uri: &str, is_dir: bool, guard: InFlightGuard) -> DbusFmOutcome {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let (done_tx, done_rx) = crossbeam_channel::bounded(1);
@@ -466,6 +466,7 @@ fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> DbusFmOutcome {
     let spawn_res = thread::Builder::new()
         .name("dbus-fm-call".to_string())
         .spawn(move || {
+            let _guard = guard;
             if cancelled_worker.load(Ordering::SeqCst) {
                 return;
             }
@@ -553,7 +554,7 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
         }
     };
 
-    // One file-manager request per thread at a time: this serializes both the D-Bus path and
+    // One file-manager request per process at a time: this serializes both the D-Bus path and
     // any CLI fallback so repeated clicks do not spawn multiple file-manager windows.
 
     #[cfg(target_os = "windows")]
@@ -595,7 +596,7 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
 
         // 1. Ensisijainen: Kevyt D-Bus IPC (org.freedesktop.FileManager1) zbus-kirjaston kautta.
         // Ei luo uutta prosessia ja pyytää taustalla olevaa tiedostonhallintaa korostamaan kohteen.
-        match show_in_file_manager_dbus(&uri, is_dir) {
+        match show_in_file_manager_dbus(&uri, is_dir, _in_flight) {
             DbusFmOutcome::Success => Ok(()),
             DbusFmOutcome::TimedOutOrBusy(msg) => {
                 #[cfg(debug_assertions)]
@@ -2394,7 +2395,7 @@ mod tests {
     fn test_show_in_file_manager_dbus_execution_or_graceful_error() {
         let start = std::time::Instant::now();
         // Even if session bus or FileManager1 is not running (e.g. CI), it must return cleanly within timeout
-        let outcome = show_in_file_manager_dbus("file:///tmp", true);
+        let outcome = show_in_file_manager_dbus("file:///tmp", true, InFlightGuard::try_acquire().unwrap());
         let elapsed = start.elapsed();
         assert!(elapsed < std::time::Duration::from_secs(3), "D-Bus call must not hang indefinitely");
         match outcome {
