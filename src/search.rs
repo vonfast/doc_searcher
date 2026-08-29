@@ -1,5 +1,6 @@
 // src/search.rs - Search logic module
 
+use crate::AppLanguage;
 use anyhow::{Context, Result};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
@@ -332,6 +333,7 @@ pub struct SearchOptions {
     pub search_txt: bool,
     pub max_file_size_mb: Option<u64>,
     pub modified_after: Option<std::time::SystemTime>,
+    pub lang: AppLanguage,
 }
 
 impl Default for SearchOptions {
@@ -350,6 +352,7 @@ impl Default for SearchOptions {
             search_txt: true,
             max_file_size_mb: None,
             modified_after: None,
+            lang: AppLanguage::English,
         }
     }
 }
@@ -548,8 +551,8 @@ fn process_candidate(
                 "fodt" | "fods" => extract_flat_xml(&candidate.path),
                 "docx" | "docm" | "dotx" | "dotm" => extract_docx(&candidate.path),
                 "odt" | "ott" | "ods" | "odp" => extract_odt(&candidate.path),
-                "pdf" => extract_pdf(&candidate.path),
-                "txt" | "text" => extract_plain_text(&candidate.path),
+                "pdf" => extract_pdf_with_lang(&candidate.path, opts.lang),
+                "txt" | "text" => extract_plain_text_with_lang(&candidate.path, opts.lang),
                 _ => return,
             };
             match raw_res {
@@ -578,8 +581,8 @@ fn process_candidate(
                 extract_docx(&candidate.path).map(|t| t.into())
             }
             "odt" | "ott" | "ods" | "odp" => extract_odt(&candidate.path).map(|t| t.into()),
-            "pdf" => extract_pdf(&candidate.path).map(|t| t.into()),
-            "txt" | "text" => extract_plain_text(&candidate.path).map(|t| t.into()),
+            "pdf" => extract_pdf_with_lang(&candidate.path, opts.lang).map(|t| t.into()),
+            "txt" | "text" => extract_plain_text_with_lang(&candidate.path, opts.lang).map(|t| t.into()),
             _ => return,
         }
     };
@@ -672,16 +675,30 @@ pub fn search_directory(
 
 const MAX_PLAIN_TEXT_FILE_SIZE: u64 = 25 * 1024 * 1024; // 25 MB max
 
+fn format_localized_error(lang: AppLanguage, finnish: &str, english: &str) -> String {
+    match lang {
+        AppLanguage::Finnish => finnish.to_string(),
+        AppLanguage::English => english.to_string(),
+    }
+}
+
 /// Extract text from plain text files (.txt, .md, .csv, .log, .json)
 pub fn extract_plain_text(path: &Path) -> Result<String> {
+    extract_plain_text_with_lang(path, AppLanguage::English)
+}
+
+pub fn extract_plain_text_with_lang(path: &Path, lang: AppLanguage) -> Result<String> {
     let metadata = std::fs::metadata(path)
         .with_context(|| format!("Could not get file metadata: {}", path.display()))?;
     let file_size = metadata.len();
 
     if file_size > MAX_PLAIN_TEXT_FILE_SIZE {
         return Err(anyhow::anyhow!(
-            "Tekstitiedosto on liian suuri (>25 MB): {}",
-            path.display()
+            format_localized_error(
+                lang,
+                &format!("Tekstitiedosto on liian suuri (>25 MB): {}", path.display()),
+                &format!("Text file is too large (>25 MB): {}", path.display()),
+            )
         ));
     }
 
@@ -701,8 +718,11 @@ pub fn extract_plain_text(path: &Path) -> Result<String> {
     let null_count = sample.iter().filter(|&&b| b == 0).count();
     if null_count > 0 {
         return Err(anyhow::anyhow!(
-            "Tiedosto sisältää binääridataa (nollatavuja): {}",
-            path.display()
+            format_localized_error(
+                lang,
+                &format!("Tiedosto sisältää binääridataa (nollatavuja): {}", path.display()),
+                &format!("File contains binary data (null bytes): {}", path.display()),
+            )
         ));
     }
 
@@ -1070,19 +1090,32 @@ const MAX_FALLBACK_TOTAL_EXTRACTED_BYTES: usize = 10 * 1024 * 1024; // 10 MB max
 
 /// Extract text from a .pdf file with header sanitization, panic safety, and fallback stream parsing
 pub fn extract_pdf(path: &Path) -> Result<String> {
+    extract_pdf_with_lang(path, AppLanguage::English)
+}
+
+pub fn extract_pdf_with_lang(path: &Path, lang: AppLanguage) -> Result<String> {
     let metadata = std::fs::metadata(path)
         .with_context(|| format!("Could not get file metadata: {}", path.display()))?;
     let file_size = metadata.len();
 
     if file_size > MAX_PDF_FILE_SIZE {
         return Err(anyhow::anyhow!(
-            "PDF-tiedosto on liian suuri (>100 MB): {}",
-            path.display()
+            format_localized_error(
+                lang,
+                &format!("PDF-tiedosto on liian suuri (>100 MB): {}", path.display()),
+                &format!("PDF file is too large (>100 MB): {}", path.display()),
+            )
         ));
     }
 
     if file_size == 0 {
-        return Err(anyhow::anyhow!("Tiedosto on tyhjä (0 tavua)"));
+        return Err(anyhow::anyhow!(
+            format_localized_error(
+                lang,
+                "Tiedosto on tyhjä (0 tavua)",
+                "File is empty (0 bytes)",
+            )
+        ));
     }
 
     use std::io::Read;

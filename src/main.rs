@@ -753,6 +753,7 @@ impl DoXsearchApp {
             directory_input: initial_dir.clone(),
             opts: SearchOptions {
                 directory: PathBuf::from(&initial_dir),
+                lang: AppLanguage::detect_from_system(),
                 ..Default::default()
             },
             state: SearchState::Idle,
@@ -2217,7 +2218,9 @@ mod tests {
         let non_existent = Path::new("/this/path/absolutely/does/not/exist/doxsearch_12345.xyz");
         let result = show_in_file_manager(non_existent);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("does not exist"));
+        let err = result.unwrap_err();
+        assert!(err.contains("Path does not exist"));
+        assert!(!err.contains("Polku"));
     }
 
     #[test]
