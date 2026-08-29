@@ -493,6 +493,38 @@ pub fn scan_candidates(
     candidates
 }
 
+fn extract_candidate_text(
+    candidate: &SearchCandidate,
+    opts: &SearchOptions,
+    current_size: u64,
+    heavy_semaphore: &HeavyTaskSemaphore,
+    is_cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<Result<Arc<str>>> {
+    let is_heavy = candidate.ext == "pdf" || current_size >= HEAVY_FILE_SIZE_THRESHOLD;
+    let _permit = if is_heavy {
+        match heavy_semaphore.acquire_cancellable(is_cancelled) {
+            Some(p) => Some(p),
+            None => return None, // cancelled while waiting for heavy permit
+        }
+    } else {
+        None
+    };
+
+    let raw_res = match candidate.ext.as_str() {
+        "fodt" | "fods" => extract_flat_xml(&candidate.path),
+        "docx" | "docm" | "dotx" | "dotm" => extract_docx(&candidate.path),
+        "odt" | "ott" | "ods" | "odp" => extract_odt(&candidate.path),
+        "pdf" => extract_pdf_with_lang(&candidate.path, opts.lang),
+        "txt" | "text" => extract_plain_text_with_lang(&candidate.path, opts.lang),
+        _ => return None,
+    };
+
+    Some(match raw_res {
+        Ok(text) => Ok(text.into()),
+        Err(e) => Err(e),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_candidate(
     candidate: &SearchCandidate,
@@ -537,53 +569,21 @@ fn process_candidate(
             cached_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(cached)
         } else {
-            let is_heavy = candidate.ext == "pdf" || current_size >= HEAVY_FILE_SIZE_THRESHOLD;
-            let _permit = if is_heavy {
-                match heavy_semaphore.acquire_cancellable(is_cancelled) {
-                    Some(p) => Some(p),
-                    None => return, // cancelled while waiting for heavy permit
-                }
-            } else {
-                None
-            };
-
-            let raw_res = match candidate.ext.as_str() {
-                "fodt" | "fods" => extract_flat_xml(&candidate.path),
-                "docx" | "docm" | "dotx" | "dotm" => extract_docx(&candidate.path),
-                "odt" | "ott" | "ods" | "odp" => extract_odt(&candidate.path),
-                "pdf" => extract_pdf_with_lang(&candidate.path, opts.lang),
-                "txt" | "text" => extract_plain_text_with_lang(&candidate.path, opts.lang),
-                _ => return,
-            };
-            match raw_res {
-                Ok(text) => {
-                    let arc_text: Arc<str> = text.into();
-                    cache.insert(cache_key, arc_text.clone());
-                    Ok(arc_text)
-                }
-                Err(e) => Err(e),
+            match extract_candidate_text(candidate, opts, current_size, heavy_semaphore, is_cancelled) {
+                Some(result) => match result {
+                    Ok(text) => {
+                        cache.insert(cache_key, text.clone());
+                        Ok(text)
+                    }
+                    Err(e) => Err(e),
+                },
+                None => return,
             }
         }
     } else {
-        let is_heavy = candidate.ext == "pdf" || current_size >= HEAVY_FILE_SIZE_THRESHOLD;
-        let _permit = if is_heavy {
-            match heavy_semaphore.acquire_cancellable(is_cancelled) {
-                Some(p) => Some(p),
-                None => return, // cancelled while waiting for heavy permit
-            }
-        } else {
-            None
-        };
-
-        match candidate.ext.as_str() {
-            "fodt" | "fods" => extract_flat_xml(&candidate.path).map(|t| t.into()),
-            "docx" | "docm" | "dotx" | "dotm" => {
-                extract_docx(&candidate.path).map(|t| t.into())
-            }
-            "odt" | "ott" | "ods" | "odp" => extract_odt(&candidate.path).map(|t| t.into()),
-            "pdf" => extract_pdf_with_lang(&candidate.path, opts.lang).map(|t| t.into()),
-            "txt" | "text" => extract_plain_text_with_lang(&candidate.path, opts.lang).map(|t| t.into()),
-            _ => return,
+        match extract_candidate_text(candidate, opts, current_size, heavy_semaphore, is_cancelled) {
+            Some(result) => result,
+            None => return,
         }
     };
 
