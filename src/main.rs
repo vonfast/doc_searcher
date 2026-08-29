@@ -215,6 +215,9 @@ pub enum LinuxFileManager {
 
 static LINUX_FM_CACHE: OnceLock<LinuxFileManager> = OnceLock::new();
 
+/// Linux detection is intentionally only used for the CLI fallback path.
+/// The UI tooltip remains generic because the D-Bus FileManager1 backend is not guaranteed to be
+/// available or to advertise a stable file manager identity.
 pub fn detect_linux_file_manager() -> LinuxFileManager {
     *LINUX_FM_CACHE.get_or_init(|| {
         // 1. Check default mime handler for inode/directory
@@ -271,6 +274,9 @@ pub fn os_file_manager_name(lang: AppLanguage) -> &'static str {
 
     #[cfg(target_os = "linux")]
     {
+        // Keep the tooltip generic on Linux because the actual D-Bus file manager may be
+        // unavailable, busy, or vary across desktop environments. The concrete detection is only
+        // used by the CLI fallback.
         match lang {
             AppLanguage::Finnish => "Tiedostonhallinta",
             AppLanguage::English => "File Manager",
