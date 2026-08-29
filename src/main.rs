@@ -381,6 +381,11 @@ pub fn get_user_downloads_dir() -> PathBuf {
         .clone()
 }
 
+/// Native file dialogs are intentionally synchronous and modal.
+///
+/// `rfd` delegates to the platform dialog implementation; running them on a worker thread would
+/// either lose the native modal behavior or create a second ephemeral UI loop. The UI thread may
+/// therefore pause while the dialog is open, which is expected and deliberate.
 pub fn pick_folder_dialog(start_dir: Option<&std::path::Path>) -> Option<PathBuf> {
     let mut dialog = rfd::FileDialog::new();
     if let Some(dir) = start_dir {
@@ -389,6 +394,7 @@ pub fn pick_folder_dialog(start_dir: Option<&std::path::Path>) -> Option<PathBuf
     dialog.pick_folder()
 }
 
+/// Native save dialog: intentional blocking modal, not async.
 pub fn save_file_dialog(default_name: &str, filter_ext: &str) -> Option<PathBuf> {
     rfd::FileDialog::new()
         .set_file_name(default_name)
