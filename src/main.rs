@@ -638,10 +638,12 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
                 #[cfg(debug_assertions)]
                 eprintln!("[DoXsearch] D-Bus FileManager1 unavailable: {dbus_err}. Falling back to CLI selection...");
 
-                // Keep the process-wide guard alive through the CLI fallback so repeated clicks remain
-                // serialized even when the bus is absent or fails to spawn.
-                let cli_guard = dbus_guard.expect("unavailable D-Bus path should return the guard for the CLI fallback");
-                let _cli_guard = cli_guard;
+                // Keep the process-wide guard alive through the CLI fallback when it is still available.
+                // If the guard is already absent, we simply continue without re-locking: the launch is
+                // still serialized by the caller, and the CLI process itself is the only remaining action.
+                if let Some(cli_guard) = dbus_guard {
+                    let _cli_guard = cli_guard;
+                }
 
                 // 2. Toissijainen varatapa: Jos D-Bus ei ole lainkaan käytettävissä (esim. SSH, rikkinäinen väylä tai rajoitettu Flatpak),
                 // yritetään suoraa tiedostonhallintakomentoa valintalipun (--select) kera kohteen korostamiseksi.
@@ -2402,14 +2404,15 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    static FILE_MANAGER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_file_manager_request_guard_is_process_global() {
+        let _test_lock = FILE_MANAGER_TEST_LOCK.lock().unwrap();
         FILE_MANAGER_REQUEST_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
 
-        let guard = match InFlightGuard::try_acquire() {
-            Some(guard) => guard,
-            None => return,
-        };
+        let guard = InFlightGuard::try_acquire().expect("main thread should acquire once");
         assert!(
             InFlightGuard::try_acquire().is_none(),
             "same-thread reentry must be blocked while a call is in flight"
@@ -2430,11 +2433,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_show_in_file_manager_dbus_execution_or_graceful_error() {
-        let guard = match InFlightGuard::try_acquire() {
-            Some(guard) => guard,
-            None => return,
-        };
+        let _test_lock = FILE_MANAGER_TEST_LOCK.lock().unwrap();
+        FILE_MANAGER_REQUEST_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
 
+        let guard = InFlightGuard::try_acquire().expect("DBus test should acquire the process guard");
         let start = std::time::Instant::now();
         // Even if session bus or FileManager1 is not running (e.g. CI), it must return cleanly within timeout.
         let (outcome, _) = show_in_file_manager_dbus("file:///tmp", true, Some(guard));
