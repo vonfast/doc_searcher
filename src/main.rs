@@ -519,6 +519,11 @@ fn show_in_file_manager_dbus(uri: &str, is_dir: bool) -> DbusFmOutcome {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn windows_explorer_select_args(path: &std::path::Path) -> (String, String) {
+    ("/select,".to_string(), path.to_string_lossy().to_string())
+}
+
 pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
     if !path.exists() {
         return Err(format!("Path does not exist: {}", path.display()));
@@ -539,9 +544,10 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        let path_str = path.to_string_lossy();
+        let (select_flag, path_str) = windows_explorer_select_args(path);
         let status = std::process::Command::new("explorer")
-            .arg(format!("/select,{}", path_str))
+            .arg(select_flag)
+            .arg(path_str)
             .status();
         if let Ok(s) = status {
             if s.success() {
@@ -2221,6 +2227,15 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.contains("Path does not exist"));
         assert!(!err.contains("Polku"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_windows_explorer_select_args_keep_path_separate() {
+        let path = Path::new(r"C:\Users\Test User\Documents\Example File.txt");
+        let (flag, path_arg) = windows_explorer_select_args(path);
+        assert_eq!(flag, "/select,");
+        assert_eq!(path_arg, r"C:\Users\Test User\Documents\Example File.txt");
     }
 
     #[test]
