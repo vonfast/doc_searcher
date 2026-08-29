@@ -1057,7 +1057,7 @@ impl DoXsearchApp {
                 }
             }
         }
-        if new_matches && self.results.len() <= 200 {
+        if new_matches {
             self.sort_results();
         }
         // Ensure selected_result is valid and within bounds
@@ -2273,6 +2273,53 @@ mod tests {
 
         assert_eq!(app.current_search_id, 5, "one new search should increment by exactly one");
         assert_eq!(app.state, SearchState::Searching);
+    }
+
+    #[test]
+    fn test_live_sort_keeps_running_after_200_results() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = DoXsearchApp {
+            opts: SearchOptions::default(),
+            directory_input: ".".to_string(),
+            state: SearchState::Searching,
+            results: Vec::new(),
+            errors: Vec::new(),
+            error: None,
+            status_info: None,
+            progress_count: (0, 0),
+            selected_result: None,
+            sort_order: SortOrder::Name,
+            date_filter: DateFilter::All,
+            size_filter: SizeFilter::NoLimit,
+            recent_directories: vec![],
+            cache: DocumentCache::new(),
+            last_search_stats: None,
+            lang: AppLanguage::Finnish,
+            current_search_id: 1,
+            cancel_flag: None,
+            tx: tx.clone(),
+            rx,
+        };
+
+        for i in 0..201 {
+            let file = format!("/tmp/file_{:03}.pdf", 200 - i);
+            tx.send(SearchMessage::MatchFound {
+                search_id: 1,
+                result: SearchResult {
+                    file: PathBuf::from(&file),
+                    file_type: "PDF".to_string(),
+                    matches: vec![search::Match { context: "match".to_string() }],
+                    modified: None,
+                },
+            })
+            .expect("send match");
+        }
+
+        app.poll_messages(&egui::Context::default());
+
+        assert_eq!(app.results.len(), 201);
+        assert_eq!(app.results.first().unwrap().file, PathBuf::from("/tmp/file_000.pdf"));
+        assert_eq!(app.results.last().unwrap().file, PathBuf::from("/tmp/file_200.pdf"));
     }
 
     #[test]
