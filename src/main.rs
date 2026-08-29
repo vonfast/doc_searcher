@@ -409,23 +409,25 @@ pub fn save_file_dialog(default_name: &str, filter_ext: &str) -> Option<PathBuf>
 }
 
 #[cfg(target_os = "linux")]
-thread_local! {
-    static FILE_MANAGER_REQUEST_IN_FLIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
+static FILE_MANAGER_REQUEST_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(target_os = "linux")]
 struct InFlightGuard;
 
 #[cfg(target_os = "linux")]
 impl InFlightGuard {
-    /// Serializes the entire Linux file-manager launch path per thread so a slow D-Bus call
-    /// cannot trigger overlapping CLI fallbacks from repeated clicks.
+    /// Serializes the entire Linux file-manager launch path across the process so repeated clicks
+    /// do not trigger overlapping D-Bus calls or duplicate CLI fallbacks while one request is in-flight.
     fn try_acquire() -> Option<Self> {
-        FILE_MANAGER_REQUEST_IN_FLIGHT.with(|flag| (!flag.replace(true)).then_some(Self))
+        FILE_MANAGER_REQUEST_IN_FLIGHT
+            .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+            .ok()
+            .map(|_| Self)
     }
 
     fn release(&self) {
-        FILE_MANAGER_REQUEST_IN_FLIGHT.with(|flag| flag.set(false));
+        FILE_MANAGER_REQUEST_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -2365,7 +2367,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn test_file_manager_request_guard_is_thread_local() {
+    fn test_file_manager_request_guard_is_process_global() {
+        FILE_MANAGER_REQUEST_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+
         let guard = InFlightGuard::try_acquire().expect("main thread should acquire once");
         assert!(
             InFlightGuard::try_acquire().is_none(),
@@ -2376,11 +2380,12 @@ mod tests {
             .join()
             .expect("other thread should finish");
         assert!(
-            other_thread_can_acquire,
-            "the in-flight guard must not be process-global across threads"
+            !other_thread_can_acquire,
+            "the in-flight guard must be process-global across threads"
         );
 
         drop(guard);
+        FILE_MANAGER_REQUEST_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[cfg(target_os = "linux")]
