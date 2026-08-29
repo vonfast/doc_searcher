@@ -8,6 +8,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::thread;
+use tracing::{debug, info, warn};
 
 const BLUE_DARK: Color32 = Color32::from_rgb(30, 58, 138);
 const BLUE_MED: Color32 = Color32::from_rgb(59, 130, 246);
@@ -408,6 +409,21 @@ pub fn save_file_dialog(default_name: &str, filter_ext: &str) -> Option<PathBuf>
         .save_file()
 }
 
+fn init_logging() {
+    static INIT: OnceLock<()> = OnceLock::new();
+
+    INIT.get_or_init(|| {
+        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .or_else(|_| tracing_subscriber::EnvFilter::try_new("info"))
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .try_init();
+    });
+}
+
 #[cfg(target_os = "linux")]
 static FILE_MANAGER_REQUEST_IN_FLIGHT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -572,8 +588,7 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
     let in_flight = match InFlightGuard::try_acquire() {
         Some(guard) => guard,
         None => {
-            #[cfg(debug_assertions)]
-            eprintln!("[DoXsearch] File manager request already in flight; skipping duplicate launch.");
+            debug!("file_manager_request_already_in_flight; skipping duplicate launch");
             return Ok(());
         }
     };
@@ -626,17 +641,15 @@ pub fn show_in_file_manager(path: &std::path::Path) -> Result<(), String> {
                 let _ = dbus_guard;
                 Ok(())
             }
-            DbusFmOutcome::TimedOutOrBusy(msg) => {
-                #[cfg(debug_assertions)]
-                eprintln!("[DoXsearch] D-Bus in progress/timed out ({msg}); waiting for D-Bus without spawning duplicate CLI process.");
+            DbusFmOutcome::TimedOutOrBusy(_msg) => {
+                warn!("dbus_file_manager_call_timed_out; waiting without duplicate cli fallback");
                 // Pyyntö on D-Bus-väylällä työn alla. Emme käynnistä rinnakkaista CLI-prosessia,
                 // jotta vältetään kahden ikkunan aukeaminen (kaksoisavaus).
                 let _ = dbus_guard;
                 Ok(())
             }
             DbusFmOutcome::Unavailable(dbus_err) => {
-                #[cfg(debug_assertions)]
-                eprintln!("[DoXsearch] D-Bus FileManager1 unavailable: {dbus_err}. Falling back to CLI selection...");
+                warn!(dbus_err = %dbus_err, "dbus_file_manager_unavailable; falling back to cli selection");
 
                 // Keep the process-wide guard alive through the CLI fallback when it is still available.
                 // If the guard is already absent, we simply continue without re-locking: the launch is
@@ -2050,6 +2063,9 @@ fn render_highlighted(ui: &mut egui::Ui, context: &str, query: &str, ignore_case
 }
 
 fn main() -> eframe::Result<()> {
+    init_logging();
+    info!("application_starting");
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("DoXsearch")

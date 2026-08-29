@@ -40,6 +40,9 @@ regex = "1.10"
 chrono = "0.4"
 # Flate/Zlib purku vioittuneiden PDF-virtojen toipumiseen
 flate2 = "1.0"
+# Jäsennelty tuotantoloki ja ympäristöstä ohjattavat logitasot
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # D-Bus IPC tiedostonhallinnan (Dolphin, Nautilus ym.) ohjaamiseen ilman prosessin luontia
