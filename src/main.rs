@@ -413,8 +413,20 @@ static FILE_MANAGER_REQUEST_IN_FLIGHT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(target_os = "linux")]
+struct FlagSlot;
+
+#[cfg(target_os = "linux")]
+impl Drop for FlagSlot {
+    fn drop(&mut self) {
+        FILE_MANAGER_REQUEST_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Clone)]
-struct InFlightGuard(std::sync::Arc<()>);
+struct InFlightGuard {
+    _slot: std::sync::Arc<FlagSlot>,
+}
 
 #[cfg(target_os = "linux")]
 impl InFlightGuard {
@@ -424,20 +436,9 @@ impl InFlightGuard {
         FILE_MANAGER_REQUEST_IN_FLIGHT
             .compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
             .ok()
-            .map(|_| Self(std::sync::Arc::new(())))
-    }
-
-    fn release(&self) {
-        if std::sync::Arc::strong_count(&self.0) == 1 {
-            FILE_MANAGER_REQUEST_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        self.release();
+            .map(|_| Self {
+                _slot: std::sync::Arc::new(FlagSlot),
+            })
     }
 }
 
