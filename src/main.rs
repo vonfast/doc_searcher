@@ -804,6 +804,26 @@ impl DoXsearchApp {
         }
     }
 
+    fn reset_search_state_for_new_run(&mut self) {
+        if let Some(flag) = &self.cancel_flag {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.cancel_flag = None;
+        if self.state == SearchState::Searching {
+            self.state = if self.results.is_empty() {
+                SearchState::Idle
+            } else {
+                SearchState::Done
+            };
+            self.progress_count = (0, 0);
+            self.status_info = Some(if self.lang == AppLanguage::Finnish {
+                "Haku peruutettu.".to_string()
+            } else {
+                "Search cancelled.".to_string()
+            });
+        }
+    }
+
     fn sort_results(&mut self) {
         let selected_path = self
             .selected_result
@@ -855,8 +875,9 @@ impl DoXsearchApp {
     }
 
     fn start_search(&mut self) {
-        // Cancel any existing search before starting a new one
-        self.cancel_search();
+        // Cancel any existing search before starting a new one without bumping the search id twice.
+        self.reset_search_state_for_new_run();
+        self.current_search_id += 1;
 
         if self.opts.query.trim().is_empty() {
             self.error = Some(if self.lang == AppLanguage::Finnish {
@@ -905,7 +926,6 @@ impl DoXsearchApp {
         self.opts.modified_after = self.date_filter.to_system_time();
         self.opts.max_file_size_mb = self.size_filter.to_mb();
 
-        self.current_search_id += 1;
         let search_id = self.current_search_id;
         let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.cancel_flag = Some(cancel_flag.clone());
@@ -2217,6 +2237,42 @@ mod tests {
         assert_eq!(app.current_search_id, 2);
         assert_eq!(app.state, SearchState::Idle);
         assert!(app.status_info.is_some());
+    }
+
+    #[test]
+    fn test_start_search_does_not_double_increment_id() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = DoXsearchApp {
+            opts: SearchOptions {
+                directory: PathBuf::from("."),
+                query: "example".to_string(),
+                ..Default::default()
+            },
+            directory_input: ".".to_string(),
+            state: SearchState::Idle,
+            results: Vec::new(),
+            errors: Vec::new(),
+            error: None,
+            status_info: None,
+            progress_count: (0, 0),
+            selected_result: None,
+            sort_order: SortOrder::DateDesc,
+            date_filter: DateFilter::All,
+            size_filter: SizeFilter::NoLimit,
+            recent_directories: vec![],
+            cache: DocumentCache::new(),
+            last_search_stats: None,
+            lang: AppLanguage::Finnish,
+            current_search_id: 4,
+            cancel_flag: None,
+            tx,
+            rx,
+        };
+
+        app.start_search();
+
+        assert_eq!(app.current_search_id, 5, "one new search should increment by exactly one");
+        assert_eq!(app.state, SearchState::Searching);
     }
 
     #[test]
