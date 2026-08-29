@@ -948,7 +948,7 @@ impl DoXsearchApp {
             match search::search_directory(
                 &opts,
                 &cache,
-                Some(&cancel_flag),
+                Some(cancel_flag.clone()),
                 move |result| {
                     let _ = tx_match.send(SearchMessage::MatchFound { search_id, result });
                 },

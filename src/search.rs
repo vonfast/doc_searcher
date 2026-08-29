@@ -367,7 +367,7 @@ pub struct SearchStats {
 pub fn scan_candidates(
     canonical_root: &Path,
     opts: &SearchOptions,
-    is_cancelled: Option<&std::sync::atomic::AtomicBool>,
+    is_cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Vec<SearchCandidate> {
     let max_depth = if opts.recursive { usize::MAX } else { 1 };
     let search_hidden = opts.search_hidden;
@@ -376,11 +376,19 @@ pub fn scan_candidates(
     let search_pdf = opts.search_pdf;
     let search_txt = opts.search_txt;
     let max_file_size_mb = opts.max_file_size_mb;
+    let read_dir_cancel = is_cancelled.clone();
 
     let walk = jwalk::WalkDirGeneric::<((), ())>::new(canonical_root)
         .max_depth(max_depth)
         .skip_hidden(false)
         .process_read_dir(move |_depth, _path, _state, children| {
+            if let Some(cancel) = read_dir_cancel.as_ref() {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    children.clear();
+                    return;
+                }
+            }
+
             children.retain(|child_res| {
                 if let Ok(entry) = child_res {
                     let ft = entry.file_type;
@@ -441,7 +449,7 @@ pub fn scan_candidates(
 
     let mut candidates = Vec::new();
     for entry_res in walk {
-        if let Some(cancel) = is_cancelled {
+        if let Some(cancel) = is_cancelled.as_ref() {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
@@ -498,11 +506,11 @@ fn extract_candidate_text(
     opts: &SearchOptions,
     current_size: u64,
     heavy_semaphore: &HeavyTaskSemaphore,
-    is_cancelled: Option<&std::sync::atomic::AtomicBool>,
+    is_cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Option<Result<Arc<str>>> {
     let is_heavy = candidate.ext == "pdf" || current_size >= HEAVY_FILE_SIZE_THRESHOLD;
     let _permit = if is_heavy {
-        match heavy_semaphore.acquire_cancellable(is_cancelled) {
+        match heavy_semaphore.acquire_cancellable(is_cancelled.as_ref().map(|flag| flag.as_ref())) {
             Some(p) => Some(p),
             None => return None, // cancelled while waiting for heavy permit
         }
@@ -531,12 +539,12 @@ fn process_candidate(
     opts: &SearchOptions,
     cache: &DocumentCache,
     heavy_semaphore: &HeavyTaskSemaphore,
-    is_cancelled: Option<&std::sync::atomic::AtomicBool>,
+    is_cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
     cached_hits: &std::sync::atomic::AtomicUsize,
     on_match: &(impl Fn(SearchResult) + Sync + Send),
     on_error: &(impl Fn(SearchError) + Sync + Send),
 ) {
-    if let Some(cancel) = is_cancelled {
+    if let Some(cancel) = is_cancelled.as_ref() {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
@@ -569,7 +577,7 @@ fn process_candidate(
             cached_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(cached)
         } else {
-            match extract_candidate_text(candidate, opts, current_size, heavy_semaphore, is_cancelled) {
+            match extract_candidate_text(candidate, opts, current_size, heavy_semaphore, is_cancelled.clone()) {
                 Some(result) => match result {
                     Ok(text) => {
                         cache.insert(cache_key, text.clone());
@@ -581,7 +589,7 @@ fn process_candidate(
             }
         }
     } else {
-        match extract_candidate_text(candidate, opts, current_size, heavy_semaphore, is_cancelled) {
+        match extract_candidate_text(candidate, opts, current_size, heavy_semaphore, is_cancelled.clone()) {
             Some(result) => result,
             None => return,
         }
@@ -619,7 +627,7 @@ fn process_candidate(
 pub fn search_directory(
     opts: &SearchOptions,
     cache: &DocumentCache,
-    is_cancelled: Option<&std::sync::atomic::AtomicBool>,
+    is_cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
     on_match: impl Fn(SearchResult) + Sync + Send,
     on_error: impl Fn(SearchError) + Sync + Send,
     progress_cb: impl Fn(usize, usize) + Sync + Send,
@@ -630,7 +638,7 @@ pub fn search_directory(
         .canonicalize()
         .unwrap_or_else(|_| opts.directory.clone());
 
-    let entries = scan_candidates(&canonical_root, opts, is_cancelled);
+    let entries = scan_candidates(&canonical_root, opts, is_cancelled.clone());
 
     let total = entries.len();
     progress_cb(0, total);
@@ -653,7 +661,7 @@ pub fn search_directory(
             opts,
             cache,
             &heavy_semaphore,
-            is_cancelled,
+            is_cancelled.clone(),
             &cached_hits,
             &on_match,
             &on_error,
@@ -1845,13 +1853,13 @@ mod tests {
             ..Default::default()
         };
 
-        let cancel_flag = std::sync::atomic::AtomicBool::new(true); // cancelled from start
+        let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)); // cancelled from start
         let match_count = std::sync::atomic::AtomicUsize::new(0);
 
         let _ = search_directory(
             &opts,
             &cache,
-            Some(&cancel_flag),
+            Some(cancel_flag.clone()),
             |_| {
                 match_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             },
@@ -2560,8 +2568,8 @@ mod tests {
         assert!(permit.is_some());
 
         // Now semaphore is exhausted (0 permits)
-        let cancel_flag = std::sync::atomic::AtomicBool::new(true);
-        let cancelled_permit = semaphore.acquire_cancellable(Some(&cancel_flag));
+        let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let cancelled_permit = semaphore.acquire_cancellable(Some(cancel_flag.as_ref()));
         assert!(
             cancelled_permit.is_none(),
             "Cancelled request must abort and return None immediately"
