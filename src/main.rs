@@ -937,6 +937,7 @@ impl DoXsearchApp {
             self.recent_directories.pop();
         }
 
+        self.opts.lang = self.lang;
         self.opts.modified_after = self.date_filter.to_system_time();
         self.opts.max_file_size_mb = self.size_filter.to_mb();
 

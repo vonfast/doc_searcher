@@ -716,13 +716,22 @@ pub fn extract_plain_text_with_lang(path: &Path, lang: AppLanguage) -> Result<St
     }
 
     use std::io::Read;
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("Could not open file: {}", path.display()))?;
+    let file = std::fs::File::open(path).with_context(|| {
+        format_localized_error(
+            lang,
+            &format!("Tiedoston avaaminen epäonnistui: {}", path.display()),
+            &format!("Could not open file: {}", path.display()),
+        )
+    })?;
     let mut bytes = Vec::new();
     let mut capped = std::io::BufReader::new(file).take(MAX_PLAIN_TEXT_FILE_SIZE.saturating_add(1));
-    capped
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("Could not read file: {}", path.display()))?;
+    capped.read_to_end(&mut bytes).with_context(|| {
+        format_localized_error(
+            lang,
+            &format!("Tiedoston lukeminen epäonnistui: {}", path.display()),
+            &format!("Could not read file: {}", path.display()),
+        )
+    })?;
 
     if bytes.len() as u64 > MAX_PLAIN_TEXT_FILE_SIZE {
         return Err(anyhow::anyhow!(
@@ -754,8 +763,11 @@ pub fn extract_plain_text_with_lang(path: &Path, lang: AppLanguage) -> Result<St
         .count();
     if sample.len() > 32 && control_count * 10 > sample.len() {
         return Err(anyhow::anyhow!(
-            "Tiedosto näyttää olevan binääritiedosto: {}",
-            path.display()
+            format_localized_error(
+                lang,
+                &format!("Tiedosto näyttää olevan binääritiedosto: {}", path.display()),
+                &format!("File appears to be binary: {}", path.display()),
+            )
         ));
     }
 
@@ -1142,13 +1154,22 @@ pub fn extract_pdf_with_lang(path: &Path, lang: AppLanguage) -> Result<String> {
     }
 
     use std::io::Read;
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("Could not open file: {}", path.display()))?;
+    let file = std::fs::File::open(path).with_context(|| {
+        format_localized_error(
+            lang,
+            &format!("Tiedoston avaaminen epäonnistui: {}", path.display()),
+            &format!("Could not open file: {}", path.display()),
+        )
+    })?;
     let mut bytes = Vec::new();
     let mut capped = std::io::BufReader::new(file).take(MAX_PDF_FILE_SIZE.saturating_add(1));
-    capped
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("Could not read file: {}", path.display()))?;
+    capped.read_to_end(&mut bytes).with_context(|| {
+        format_localized_error(
+            lang,
+            &format!("Tiedoston lukeminen epäonnistui: {}", path.display()),
+            &format!("Could not read file: {}", path.display()),
+        )
+    })?;
 
     if bytes.len() as u64 > MAX_PDF_FILE_SIZE {
         return Err(anyhow::anyhow!(
@@ -1173,7 +1194,11 @@ pub fn extract_pdf_with_lang(path: &Path, lang: AppLanguage) -> Result<String> {
             return Ok(text);
         }
         return Err(anyhow::anyhow!(
-            "Tiedosto ei ole kelvollinen PDF (puuttuva %PDF-otsake)"
+            format_localized_error(
+                lang,
+                "Tiedosto ei ole kelvollinen PDF (puuttuva %PDF-otsake)",
+                "File is not a valid PDF (missing %PDF header)",
+            )
         ));
     };
 
@@ -1190,7 +1215,11 @@ pub fn extract_pdf_with_lang(path: &Path, lang: AppLanguage) -> Result<String> {
                 Ok(text)
             } else {
                 Err(anyhow::anyhow!(
-                    "PDF-tiedoston tekstirakenne on vioittunut tai suojattu"
+                    format_localized_error(
+                        lang,
+                        "PDF-tiedoston tekstirakenne on vioittunut tai suojattu",
+                        "PDF text structure is corrupted or protected",
+                    )
                 ))
             }
         }
