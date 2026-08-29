@@ -708,11 +708,23 @@ pub fn extract_plain_text_with_lang(path: &Path, lang: AppLanguage) -> Result<St
     }
 
     use std::io::Read;
-    let mut file = std::fs::File::open(path)
+    let file = std::fs::File::open(path)
         .with_context(|| format!("Could not open file: {}", path.display()))?;
-    let mut bytes = Vec::with_capacity(file_size as usize);
-    file.read_to_end(&mut bytes)
+    let mut bytes = Vec::new();
+    let mut capped = std::io::BufReader::new(file).take(MAX_PLAIN_TEXT_FILE_SIZE.saturating_add(1));
+    capped
+        .read_to_end(&mut bytes)
         .with_context(|| format!("Could not read file: {}", path.display()))?;
+
+    if bytes.len() as u64 > MAX_PLAIN_TEXT_FILE_SIZE {
+        return Err(anyhow::anyhow!(
+            format_localized_error(
+                lang,
+                &format!("Tekstitiedosto on liian suuri (>25 MB): {}", path.display()),
+                &format!("Text file is too large (>25 MB): {}", path.display()),
+            )
+        ));
+    }
 
     // Binary check: inspect first 4096 bytes
     let sample = &bytes[..bytes.len().min(4096)];
@@ -958,7 +970,8 @@ pub fn extract_odt(path: &Path) -> Result<String> {
             full_text.push('\n');
         }
         let reader = Reader::from_reader(std::io::BufReader::new(styles));
-        let _ = extract_text_from_xml_reader_into(reader, false, &mut full_text);
+        extract_text_from_xml_reader_into(reader, false, &mut full_text)
+            .with_context(|| format!("Error reading styles.xml in odt: {}", path.display()))?;
     }
 
     Ok(full_text)
@@ -1121,11 +1134,23 @@ pub fn extract_pdf_with_lang(path: &Path, lang: AppLanguage) -> Result<String> {
     }
 
     use std::io::Read;
-    let mut file = std::fs::File::open(path)
+    let file = std::fs::File::open(path)
         .with_context(|| format!("Could not open file: {}", path.display()))?;
-    let mut bytes = Vec::with_capacity(file_size as usize);
-    file.read_to_end(&mut bytes)
+    let mut bytes = Vec::new();
+    let mut capped = std::io::BufReader::new(file).take(MAX_PDF_FILE_SIZE.saturating_add(1));
+    capped
+        .read_to_end(&mut bytes)
         .with_context(|| format!("Could not read file: {}", path.display()))?;
+
+    if bytes.len() as u64 > MAX_PDF_FILE_SIZE {
+        return Err(anyhow::anyhow!(
+            format_localized_error(
+                lang,
+                &format!("PDF-tiedosto on liian suuri (>100 MB): {}", path.display()),
+                &format!("PDF file is too large (>100 MB): {}", path.display()),
+            )
+        ));
+    }
 
     // 1. Sanitize header: if there are leading bytes before %PDF-, trim to %PDF-
     let pdf_bytes = if let Some(pos) = bytes.windows(5).position(|w| w == b"%PDF-") {
@@ -2742,6 +2767,35 @@ mod tests {
         out.clear();
         unescape_xml_into(b"Rock & Roll &unknown; &amp; End", &mut out);
         assert_eq!(out, "Rock & Roll &unknown; & End");
+    }
+
+    #[test]
+    fn test_extract_odt_invalid_styles_xml_is_not_silently_ignored() {
+        use std::io::Write;
+        let temp_dir = std::env::temp_dir().join(format!("doxsearch_odt_styles_err_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let odt_path = temp_dir.join("invalid_styles.odt");
+        {
+            let file = std::fs::File::create(&odt_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+
+            zip.start_file("content.xml", options).unwrap();
+            zip.write_all(b"<office:document-content xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\"><text:p>ODT Main Content</text:p></office:document-content>").unwrap();
+
+            zip.start_file("styles.xml", options).unwrap();
+            zip.write_all(b"<office:document-styles xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\"><text:p>broken</text:q>").unwrap();
+
+            zip.finish().unwrap();
+        }
+
+        let err = extract_odt(&odt_path).unwrap_err();
+        assert!(err.to_string().contains("styles.xml"));
+
+        let _ = std::fs::remove_file(&odt_path);
+        let _ = std::fs::remove_dir(&temp_dir);
     }
 
     #[test]
